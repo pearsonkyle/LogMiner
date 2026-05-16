@@ -63,25 +63,6 @@ python -m logtrain parse --source claude --output data/raw.jsonl
 python -m logtrain validate --input data/raw.jsonl --model Qwen/Qwen3.5-4B
 ```
 
-## Commands
-
-| Command    | Purpose                                                          | Required flags                          | Notable optional flags                                                |
-| ---------- | ---------------------------------------------------------------- | --------------------------------------- | --------------------------------------------------------------------- |
-| `parse`    | Read provider logs and normalize them into OpenAI-style messages | `--source {claude,opencode,qwen,all}`, `--output` | `--input` (defaults to the provider's standard log dir)        |
-| `redact`   | Scrub secrets (API keys, tokens, URLs) and anonymize user paths  | `--input`, `--output`                   | —                                                                     |
-| `clean`    | Drop malformed tool calls, orphaned tool results, empty turns    | `--input`, `--output`                   | `--no-remove-orphaned`                                                |
-| `evaluate` | Attach a `score` (float in [0, 1]) to each conversation          | `--input`, `--output`                   | `--min-turns` (default 2), `--min-token-count` (default 1000)         |
-| `filter`   | Keep records with `score ≥ --min-score`, write in training format | `--input`, `--output`                  | `--min-score` (default 0.5)                                           |
-| `validate` | Apply a chat template via `transformers.AutoTokenizer` and report tokens, tool calls, and any failures | `--input` *or* `--source` | `--output` (writes only records that passed), `--model` (default `Qwen/Qwen3.5-4B`) |
-| `run`      | Chain parse → redact → clean → evaluate → filter end-to-end      | `--source`, `--output`                  | `--input`, `--min-score` (default 0.5)                                |
-
-### Output paths
-
-`--output` paths without a suffix are auto-completed to `.jsonl`. A bare
-`data/training` becomes `data/training.jsonl` (with a one-line `Note:` printed
-to stderr). Existing suffixes (`.jsonl`, `.json`, anything else) are left
-alone. Parent directories are created automatically.
-
 ### Default log locations
 
 When you omit `--input`, the parser falls back to each provider's standard
@@ -141,22 +122,6 @@ for rec in ds:
     tools = msgs[0].pop("tools", None) if msgs else None
     # tokenizer.apply_chat_template(msgs, tools=tools, ...)
 ```
-
-## Troubleshooting
-
-- **`validate` fails on a record** — open the failing id in
-  `<output>_cleaned.jsonl` and check for missing `tool_call_id` pairings or
-  empty assistant content. Most chat-template failures trace back to those.
-- **Suspiciously few records survive `filter`** — eyeball the `score`
-  distribution in `<output>_scored.jsonl`. If most scores sit below 0.5, your
-  logs are short/noisy: lower `--min-score`, or relax `--min-turns` /
-  `--min-token-count` in `evaluate`.
-- **Secrets leaking through** — add a regex to
-  `logtrain/redaction/secrets.py` and rerun just the `redact` stage on the
-  existing `_raw.jsonl` (no need to re-parse).
-- **`run` halted mid-pipeline** — every stage is idempotent and reads only the
-  previous stage's file, so you can resume by invoking the next stage directly
-  with `--input <the partial file>`.
 
 ## Extending
 
