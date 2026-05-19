@@ -19,6 +19,20 @@ def test_run_parser_accepts_hf_repo():
     assert args.hf_repo == "me/data"
 
 
+def test_filter_parser_accepts_hf_private():
+    args = cli.build_parser().parse_args(
+        ["filter", "--input", "in.jsonl", "--output", "out.jsonl", "--hf-private"]
+    )
+    assert args.hf_private is True
+
+
+def test_run_parser_accepts_hf_private():
+    args = cli.build_parser().parse_args(
+        ["run", "--source", "claude", "--output", "out.jsonl", "--hf-private"]
+    )
+    assert args.hf_private is True
+
+
 def test_upload_dataset_skips_without_token(tmp_path, capsys, monkeypatch):
     for env_var in cli.HF_TOKEN_ENV_VARS:
         monkeypatch.delenv(env_var, raising=False)
@@ -52,14 +66,14 @@ def test_upload_dataset_uses_huggingface_hub(tmp_path, monkeypatch):
     path = tmp_path / "training.jsonl"
     path.write_text("{}\n")
 
-    uploaded = cli._upload_dataset_to_huggingface(path, "me/data")
+    uploaded = cli._upload_dataset_to_huggingface(path, "me/data", private=True)
 
     assert uploaded is True
     assert calls == [
         ("init", {"token": "hf_test_token"}),
         (
             "create_repo",
-            {"repo_id": "me/data", "repo_type": "dataset", "exist_ok": True},
+            {"repo_id": "me/data", "repo_type": "dataset", "private": True, "exist_ok": True},
         ),
         (
             "upload_file",
@@ -111,11 +125,11 @@ def test_cmd_filter_uploads_when_hf_repo_is_set(tmp_path, monkeypatch):
         )
         + "\n"
     )
-    uploads: list[tuple[str, str]] = []
+    uploads: list[tuple[str, str, bool]] = []
     monkeypatch.setattr(
         cli,
         "_upload_dataset_to_huggingface",
-        lambda path, repo_id: uploads.append((str(path), repo_id)) or True,
+        lambda path, repo_id, private=False: uploads.append((str(path), repo_id, private)) or True,
     )
 
     cli.cmd_filter(
@@ -124,19 +138,24 @@ def test_cmd_filter_uploads_when_hf_repo_is_set(tmp_path, monkeypatch):
             output=str(output_path),
             min_score=0.5,
             hf_repo="me/data",
+            hf_private=True,
         )
     )
 
-    assert uploads == [(str(output_path.with_suffix(".jsonl")), "me/data")]
+    assert uploads == [(str(output_path.with_suffix(".jsonl")), "me/data", True)]
 
 
 def test_cmd_run_passes_hf_repo_to_filter(tmp_path, monkeypatch):
-    seen: list[str | None] = []
+    seen: list[tuple[str | None, bool]] = []
     monkeypatch.setattr(cli, "cmd_parse", lambda args: None)
     monkeypatch.setattr(cli, "cmd_redact", lambda args: None)
     monkeypatch.setattr(cli, "cmd_clean", lambda args: None)
     monkeypatch.setattr(cli, "cmd_evaluate", lambda args: None)
-    monkeypatch.setattr(cli, "cmd_filter", lambda args: seen.append(args.hf_repo))
+    monkeypatch.setattr(
+        cli,
+        "cmd_filter",
+        lambda args: seen.append((args.hf_repo, args.hf_private)),
+    )
 
     cli.cmd_run(
         argparse.Namespace(
@@ -145,7 +164,8 @@ def test_cmd_run_passes_hf_repo_to_filter(tmp_path, monkeypatch):
             output=str(tmp_path / "training.jsonl"),
             min_score=0.5,
             hf_repo="me/data",
+            hf_private=True,
         )
     )
 
-    assert seen == ["me/data"]
+    assert seen == [("me/data", True)]

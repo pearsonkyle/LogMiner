@@ -67,11 +67,13 @@ When upload runs, logminer also writes a dataset-card `README.md` with a
 consistent `logminer` tag and a link back to this GitHub repo so those datasets
 are easier to find on Hugging Face.
 
+Pass `--hf-private` if you want the dataset repo created as private.
+
 If you already ran the earlier stages yourself, `filter` can upload the final
 JSONL too:
 
 ```bash
-python -m logminer filter --input data/scored.jsonl --output data/training.jsonl --hf-repo your-name/logminer-data
+python -m logminer filter --input data/scored.jsonl --output data/training.jsonl --hf-repo your-name/logminer-data --hf-private
 ```
 
 Parse only, then sanity-check records against a real tokenizer:
