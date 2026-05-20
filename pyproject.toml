@@ -16,6 +16,7 @@ dependencies = []
 
 [project.optional-dependencies]
 # `validate` subcommand needs a tokenizer.
+huggingface = ["huggingface-hub>=1.15.0"]
 validate = ["transformers>=4.40"]
 test = ["pytest"]
 
