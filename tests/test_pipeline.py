@@ -3,6 +3,7 @@
 import json
 
 from logminer.pipeline.cleanup import (
+    cap_conversation_length,
     clean_conversation,
     format_for_training,
     has_failed_command,
@@ -721,7 +722,7 @@ class TestCleanerBoundaries:
     def test_plan_approval_text_kept(self):
         """Claude's plan-approval system message must survive cleaning."""
         content = (
-            "User has approved your plan. You can now start coding. " "Start with the first todo."
+            "User has approved your plan. You can now start coding. Start with the first todo."
         )
         assert has_failed_command(content) is False
 
@@ -805,3 +806,78 @@ class TestCleanerBoundaries:
             assert m["role"] != "tool"
             if m["role"] == "assistant":
                 assert not m.get("tool_calls")
+
+
+# ---------------------------------------------------------------------------
+# Length capping
+# ---------------------------------------------------------------------------
+
+
+class TestCapConversationLength:
+    """Only 37% of a real 522-session corpus fit a 32k context and the
+    largest record was ~3.8M estimated tokens, so an uncapped dataset
+    silently depends on the trainer's overflow behaviour. Truncation keeps
+    a prefix (still a valid trajectory) rather than dropping the record.
+    """
+
+    def _long_conv(self, n_pairs=40):
+        messages = [{"role": "system", "content": "sys"}, {"role": "user", "content": "go"}]
+        for i in range(n_pairs):
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {"id": f"c{i}", "function": {"name": "Bash", "arguments": "{}"}}
+                    ],
+                }
+            )
+            messages.append({"role": "tool", "tool_call_id": f"c{i}", "content": "x" * 4000})
+        return {"id": "long", "messages": messages}
+
+    def test_short_conversation_untouched(self):
+        conv = {"id": "s", "messages": [{"role": "user", "content": "hi"}]}
+        out, truncated = cap_conversation_length(conv, max_tokens=131072)
+        assert truncated is False
+        assert out == conv
+
+    def test_long_conversation_truncated(self):
+        out, truncated = cap_conversation_length(self._long_conv(), max_tokens=5000)
+        assert truncated is True
+        assert len(out["messages"]) < len(self._long_conv()["messages"])
+
+    def test_system_message_always_kept(self):
+        out, _ = cap_conversation_length(self._long_conv(), max_tokens=10)
+        assert out["messages"][0]["role"] == "system"
+
+    def test_truncation_leaves_no_orphaned_tool_calls(self):
+        """A cut mid-pair must not leave a tool_call without its result."""
+        for budget in (500, 2000, 5000, 20000, 50000):
+            out, _ = cap_conversation_length(self._long_conv(), max_tokens=budget)
+            result_ids = {m.get("tool_call_id") for m in out["messages"] if m.get("role") == "tool"}
+            for m in out["messages"]:
+                for tc in m.get("tool_calls") or []:
+                    assert tc["id"] in result_ids, f"orphaned call at budget={budget}"
+
+    def test_truncation_does_not_end_on_tool_result(self):
+        """Only applies when a cut was made — an untruncated record keeps
+        whatever shape the session actually had."""
+        for budget in (500, 2000, 5000, 20000):
+            out, truncated = cap_conversation_length(self._long_conv(), max_tokens=budget)
+            assert truncated is True
+            if out["messages"]:
+                assert out["messages"][-1]["role"] != "tool", f"ends on tool at budget={budget}"
+
+    def test_output_respects_budget(self):
+        from logminer.pipeline.evaluate import estimate_token_count
+
+        budget = 20000
+        out, _ = cap_conversation_length(self._long_conv(), max_tokens=budget)
+        total = sum(estimate_token_count(m.get("content") or "") for m in out["messages"])
+        assert total <= budget
+
+    def test_original_record_not_mutated(self):
+        conv = self._long_conv()
+        before = len(conv["messages"])
+        cap_conversation_length(conv, max_tokens=5000)
+        assert len(conv["messages"]) == before

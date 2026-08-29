@@ -7,9 +7,14 @@ import sys
 from pathlib import Path
 from typing import Any
 
+# Safe to import eagerly: cleanup.py is stdlib-only, same as this module.
+from logminer.pipeline.cleanup import DEFAULT_MAX_TOKENS
+
 HF_TOKEN_ENV_VARS = ("HF_TOKEN", "HUGGINGFACE_HUB_TOKEN", "HUGGING_FACE_HUB_TOKEN")
 LOGMINER_DATASET_TAGS = ("logminer", "coding-agent-logs")
 LOGMINER_REPO_URL = "https://github.com/pearsonkyle/LogMiner"
+# Fixed repo-side location so repeated uploads replace rather than accumulate.
+HF_DATA_PATH = "data/train.jsonl"
 
 
 def _load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -58,7 +63,7 @@ def _build_huggingface_dataset_card(path: Path, repo_id: str) -> str:
         f"This dataset was uploaded with [LogMiner]({LOGMINER_REPO_URL}).\n\n"
         "## Provenance\n\n"
         f"- Source repository: [{LOGMINER_REPO_URL}]({LOGMINER_REPO_URL})\n"
-        f"- Uploaded file: `{path.name}`\n"
+        f"- Uploaded file: `{HF_DATA_PATH}` (from `{path.name}`)\n"
         "- Upload tool: `logminer --hf-repo`\n"
     )
 
@@ -67,11 +72,12 @@ def _upload_dataset_to_huggingface(path: Path, repo_id: str, private: bool = Fal
     token_env_var, token = _get_huggingface_token()
     if not token:
         env_vars = ", ".join(HF_TOKEN_ENV_VARS)
-        print(
-            f"Skipping Hugging Face upload for {repo_id}: no token found in {env_vars}.",
-            file=sys.stderr,
+        # --hf-repo is an explicit request, so a missing token is an error
+        # rather than a warning. Exiting 0 here let scheduled jobs report
+        # green while never publishing anything.
+        raise SystemExit(
+            f"Hugging Face upload requested for {repo_id} but no token found in {env_vars}."
         )
-        return False
 
     try:
         hub_module = importlib.import_module("huggingface_hub")
@@ -82,16 +88,32 @@ def _upload_dataset_to_huggingface(path: Path, repo_id: str, private: bool = Fal
 
     api = hub_module.HfApi(token=token)
     api.create_repo(repo_id=repo_id, repo_type="dataset", private=private, exist_ok=True)
-    api.upload_file(
-        path_or_fileobj=_build_huggingface_dataset_card(path, repo_id).encode(),
-        path_in_repo="README.md",
-        repo_id=repo_id,
-        repo_type="dataset",
-        commit_message="Add dataset card metadata from logminer",
-    )
+
+    # create_repo(private=…) only applies at creation time, so on a repo that
+    # already exists --hf-private would silently do nothing and push fresh
+    # agent logs into a public dataset.
+    if private:
+        api.update_repo_settings(repo_id=repo_id, repo_type="dataset", private=True)
+
+    # Only seed the dataset card when there isn't one. Overwriting on every
+    # upload would clobber a hand-written card (license, splits, citation,
+    # `configs:` for the viewer) with four lines of boilerplate.
+    if not api.file_exists(repo_id=repo_id, filename="README.md", repo_type="dataset"):
+        api.upload_file(
+            path_or_fileobj=_build_huggingface_dataset_card(path, repo_id).encode(),
+            path_in_repo="README.md",
+            repo_id=repo_id,
+            repo_type="dataset",
+            commit_message="Add dataset card metadata from logminer",
+        )
+
+    # Fixed repo-side path. Uploading under the local filename let successive
+    # runs with different --output names pile up as separate files at the
+    # root, where load_dataset() globs them all into one split and silently
+    # duplicates every conversation.
     api.upload_file(
         path_or_fileobj=str(path),
-        path_in_repo=path.name,
+        path_in_repo=HF_DATA_PATH,
         repo_id=repo_id,
         repo_type="dataset",
         commit_message=f"Upload {path.name} from logminer",
@@ -120,12 +142,32 @@ def cmd_parse(args: argparse.Namespace) -> None:
 
 
 def cmd_redact(args: argparse.Namespace) -> None:
-    from logminer.redaction.anonymizer import Anonymizer
+    from logminer.redaction.anonymizer import Anonymizer, harvest_identities
     from logminer.redaction.secrets import redact_text
 
-    anon = Anonymizer()
     records = _load_jsonl(Path(args.input))
     total_redacted = 0
+    anon = Anonymizer()
+
+    def message_texts(messages: list[dict[str, Any]]) -> list[str]:
+        """Every string in a message that may contain an identifying path."""
+        out = []
+        for msg in messages:
+            if msg.get("content"):
+                out.append(str(msg["content"]))
+            # Tool *names* carry project identity via MCP server names
+            # (`mcp__deckdoctor__lookup`), on both the assistant's call and
+            # the tool result that answers it.
+            if msg.get("name"):
+                out.append(str(msg["name"]))
+            for tc in msg.get("tool_calls") or []:
+                func = tc.get("function") or {}
+                if func.get("name"):
+                    out.append(str(func["name"]))
+                if func.get("arguments"):
+                    a = func["arguments"]
+                    out.append(json.dumps(a) if isinstance(a, dict) else str(a))
+        return out
 
     def redact_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         nonlocal total_redacted
@@ -136,12 +178,19 @@ def cmd_redact(args: argparse.Namespace) -> None:
                 text, count = redact_text(anon.text(str(m["content"])))
                 m["content"] = text
                 total_redacted += count
+            # `name` on a tool result mirrors the tool that was called;
+            # anonymize (but don't secret-scan) it. Built-in names like
+            # `Bash` are untouched — only harvested project/MCP names map.
+            if m.get("name"):
+                m["name"] = anon.text(str(m["name"]))
             # Also redact tool call arguments (preserve JSON structure)
             if m.get("tool_calls"):
                 new_calls = []
                 for tc in m["tool_calls"]:
                     tc = dict(tc)
                     func = tc.get("function", {})
+                    if func and func.get("name"):
+                        tc["function"] = func = {**func, "name": anon.text(str(func["name"]))}
                     if func and func.get("arguments"):
                         args = func["arguments"]
                         # Serialize to JSON string for redaction, then parse back
@@ -159,11 +208,49 @@ def cmd_redact(args: argparse.Namespace) -> None:
             cleaned.append(m)
         return cleaned
 
+    # Corpus-wide identity pass. Evidence that a name is identifying is
+    # unevenly spread: a username appears as `/home/<name>/…` in a few
+    # sessions and only as `github.com/<name>/…` in the rest, and a project
+    # appears as a path in some sessions and only as an MCP tool name in
+    # others. Harvesting across every record first lets each session
+    # substitute names it has no local evidence for.
+    corpus_users: set[str] = set()
+    corpus_projects: set[str] = set()
+    for rec in records:
+        for text in message_texts(rec.get("messages", [])):
+            users, projects = harvest_identities(text)
+            corpus_users |= users
+            corpus_projects |= projects
+
     output = []
     for rec in records:
         r = dict(rec)
         if "messages" in r:
+            # One persona per session, so the corpus carries many distinct
+            # home directories instead of a single memorizable literal.
+            # Prescan first: bare project names can only be substituted once
+            # every path in the record has been seen (a name introduced by a
+            # path late in the session also appears in prose early in it).
+            anon = Anonymizer(
+                session_key=str(r.get("id", "")),
+                extra_usernames=sorted(corpus_users),
+                extra_projects=sorted(corpus_projects),
+            )
+            for text in message_texts(r["messages"]):
+                anon.prescan(text)
+            if r.get("tools"):
+                anon.prescan(json.dumps(r["tools"]))
             r["messages"] = redact_messages(r["messages"])
+            # The top-level `tools` schema is not part of `messages`, but
+            # `format_for_training` embeds it into `messages[0]["tools"]`
+            # downstream — so it lands in the training file and has to be
+            # redacted too. Tool names and descriptions carry project
+            # identity (`mcp__deckdoctor__…`) and can quote secrets.
+            if r.get("tools"):
+                tools_json, count = redact_text(anon.text(json.dumps(r["tools"])))
+                total_redacted += count
+                with contextlib.suppress(json.JSONDecodeError):
+                    r["tools"] = json.loads(tools_json)
         output.append(r)
 
     output_path = _ensure_jsonl(args.output)
@@ -222,14 +309,24 @@ def _to_arrow_safe(record: dict[str, Any]) -> dict[str, Any]:
 
 
 def cmd_filter(args: argparse.Namespace) -> None:
-    from logminer.pipeline.cleanup import format_for_training
+    from logminer.pipeline.cleanup import cap_conversation_length, format_for_training
 
     records = _load_jsonl(Path(args.input))
     filtered = [r for r in records if r.get("score", 0) >= args.min_score]
-    formatted = [_to_arrow_safe(format_for_training(r)) for r in filtered]
+
+    truncated = 0
+    capped = []
+    for rec in filtered:
+        rec, was_truncated = cap_conversation_length(rec, max_tokens=args.max_tokens)
+        truncated += was_truncated
+        capped.append(rec)
+
+    formatted = [_to_arrow_safe(format_for_training(r)) for r in capped]
     output_path = _ensure_jsonl(args.output)
     _write_jsonl(output_path, formatted)
     print(f"Filtered {len(records)} → {len(filtered)} records (min-score={args.min_score})")
+    if truncated:
+        print(f"Truncated {truncated} records to the {args.max_tokens:,}-token cap")
     if args.hf_repo:
         _upload_dataset_to_huggingface(output_path, args.hf_repo, private=args.hf_private)
 
@@ -386,6 +483,8 @@ def cmd_run(args: argparse.Namespace) -> None:
                 str(final_output),
                 "--min-score",
                 str(args.min_score),
+                "--max-tokens",
+                str(args.max_tokens),
                 *(["--hf-repo", args.hf_repo] if args.hf_repo else []),
                 *(["--hf-private"] if args.hf_private else []),
             ]
@@ -433,6 +532,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_filter.add_argument("--output", required=True)
     p_filter.add_argument("--min-score", type=float, default=0.5)
     p_filter.add_argument(
+        "--max-tokens",
+        type=int,
+        default=DEFAULT_MAX_TOKENS,
+        help=(
+            "Truncate conversations longer than this many estimated tokens, "
+            "cutting at a boundary that keeps tool calls paired (default: %(default)s)"
+        ),
+    )
+    p_filter.add_argument(
         "--hf-repo",
         default=None,
         help=(
@@ -459,6 +567,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--input", default=None)
     p_run.add_argument("--output", required=True)
     p_run.add_argument("--min-score", type=float, default=0.5)
+    p_run.add_argument(
+        "--max-tokens",
+        type=int,
+        default=DEFAULT_MAX_TOKENS,
+        help="Truncate conversations longer than this many estimated tokens",
+    )
     p_run.add_argument(
         "--hf-repo",
         default=None,

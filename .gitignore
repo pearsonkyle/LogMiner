@@ -26,6 +26,12 @@ ENV/
 htmlcov/
 coverage.xml
 
+# Pipeline output. `main()`'s default argv writes logminer.jsonl into the
+# cwd, so running the CLI from a checkout drops mined transcripts in the
+# repo root. `*_raw.jsonl` is pre-redaction and may contain live API keys —
+# a stray `git add -A` would publish them.
+*.jsonl
+
 # IDE / OS
 .idea/
 .vscode/

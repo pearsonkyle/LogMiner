@@ -41,6 +41,88 @@ def _luhn_valid(digits: str) -> bool:
     return total % 10 == 0
 
 
+# --- Context gates for high-false-positive patterns -----------------------
+#
+# Two patterns below match shapes that are extremely common in ordinary
+# developer output. Measured on a 522-session Claude corpus, the bare
+# `credit_card` rule fired 194 times with a *100% false-positive rate*:
+# every hit was either a Unix millisecond timestamp (`"startedAt":
+# 1787585109642`) or the digits after a decimal point in an ML metric
+# (`'mrr@10': 0.48486721611721617`). Luhn is a checksum, not a
+# discriminator — it passes ~10% of arbitrary digit runs.
+#
+# The damage is worse than a missed redaction: the replacement lands
+# *inside* a number, rewriting `0.48486721611721617` as
+# `0.[REDACTED_CREDIT_CARD]` and teaching the model to emit redaction
+# tokens in the middle of numeric output.
+#
+# Both patterns therefore now require corroborating evidence beyond the
+# raw shape: card-style separators or a payment keyword nearby; a wallet
+# keyword for 0x-prefixed 32-byte hex (which otherwise matches every
+# SHA-256 digest written with an 0x prefix).
+
+_CC_CONTEXT_RX = re.compile(
+    r"credit[\s_-]?card|\bcards?\b|cardnumber|\bccnum\b"
+    r"|\bcc[\s_-]?(?:number|num)\b|payment|\bvisa\b|mastercard|\bamex\b"
+    r"|american express|\bdiscover\b|\bjcb\b|diners",
+    re.IGNORECASE,
+)
+
+# 4-4-4-N grouped with spaces or dashes — the way cards are actually written.
+_CC_SEPARATED_RX = re.compile(r"^\d{4}[ -]\d{4}[ -]\d{4}[ -]\d{1,7}$")
+
+_ETH_CONTEXT_RX = re.compile(
+    r"private[\s_-]?key|privkey|\bpk\b|secret[\s_-]?key|mnemonic|seed[\s_-]?phrase"
+    r"|wallet|keystore|\bsigner\b|\bdeployer\b",
+    re.IGNORECASE,
+)
+
+_CONTEXT_WINDOW = 48
+
+
+def _has_context(text: str, start: int, end: int, rx: re.Pattern[str]) -> bool:
+    """True if ``rx`` matches within ``_CONTEXT_WINDOW`` chars either side."""
+    lo = max(0, start - _CONTEXT_WINDOW)
+    return bool(rx.search(text, lo, start)) or bool(
+        rx.search(text, end, min(len(text), end + _CONTEXT_WINDOW))
+    )
+
+
+def _is_credit_card(matched: str, text: str, start: int, end: int) -> bool:
+    """Luhn-valid *and* corroborated as a card rather than a number.
+
+    Rejects runs adjacent to a decimal point (the digits of a float) and
+    requires either card-style grouping or a payment keyword nearby.
+    """
+    digits = re.sub(r"[ -]", "", matched)
+    if not (13 <= len(digits) <= 19) or not _luhn_valid(digits):
+        return False
+    # A `.` on either side means we are inside a decimal number, not a card.
+    if start > 0 and text[start - 1] == ".":
+        return False
+    if end < len(text) and text[end] == ".":
+        return False
+    if _CC_SEPARATED_RX.match(matched):
+        return True
+    return _has_context(text, start, end, _CC_CONTEXT_RX)
+
+
+def _is_eth_private_key(text: str, start: int, end: int) -> bool:
+    """0x + 64 hex is also every SHA-256 digest — require wallet context."""
+    return _has_context(text, start, end, _ETH_CONTEXT_RX)
+
+
+def _keep_match(name: str, matched: str, text: str, start: int, end: int) -> bool:
+    """Shared accept/reject gate applied by both ``scan_text`` and ``redact_text``."""
+    if name == "email":
+        return not _is_allowlisted(matched)
+    if name == "credit_card":
+        return _is_credit_card(matched, text, start, end)
+    if name == "ethereum_private_key":
+        return _is_eth_private_key(text, start, end)
+    return True
+
+
 def _find_mnemonics(text: str) -> list[tuple[int, int]]:
     """Find BIP-39 mnemonic seed phrases (12/15/18/21/24 words from the wordlist).
 
@@ -207,16 +289,12 @@ def scan_text(text: str) -> list[Finding]:
     for name, pattern in PATTERNS:
         for match in pattern.finditer(text):
             matched = match.group(0)
-            if name == "email" and _is_allowlisted(matched):
-                continue
             if name == "env_secret":
                 val = match.group(2) if match.lastindex and match.lastindex >= 2 else ""
                 if _shannon_entropy(val) < 3.0:
                     continue
-            if name == "credit_card":
-                digits = re.sub(r"[ -]", "", matched)
-                if not (13 <= len(digits) <= 19) or not _luhn_valid(digits):
-                    continue
+            elif not _keep_match(name, matched, text, match.start(), match.end()):
+                continue
             findings.append(
                 Finding(
                     pattern_name=name,
@@ -246,8 +324,6 @@ def redact_text(text: str) -> tuple[str, int]:
     for name, pattern in PATTERNS:
         for match in pattern.finditer(text):
             matched = match.group(0)
-            if name == "email" and _is_allowlisted(matched):
-                continue
             if name == "env_secret":
                 val = match.group(2) if match.lastindex and match.lastindex >= 2 else ""
                 if _shannon_entropy(val) < 3.0:
@@ -255,10 +331,8 @@ def redact_text(text: str) -> tuple[str, int]:
                 # Redact only the value, preserve the variable name.
                 replacements.append((match.start(2), match.end(2), f"[REDACTED_{name.upper()}]"))
                 continue
-            if name == "credit_card":
-                digits = re.sub(r"[ -]", "", matched)
-                if not (13 <= len(digits) <= 19) or not _luhn_valid(digits):
-                    continue
+            if not _keep_match(name, matched, text, match.start(), match.end()):
+                continue
             replacements.append((match.start(), match.end(), f"[REDACTED_{name.upper()}]"))
 
     for m_start, m_end in _find_mnemonics(text):

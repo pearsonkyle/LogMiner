@@ -130,6 +130,82 @@ def clean_conversation(
     )
 
 
+DEFAULT_MAX_TOKENS = 131_072
+
+
+def _message_token_cost(msg: dict[str, Any]) -> int:
+    """Estimated tokens for one message, including its tool-call payload."""
+    from logminer.pipeline.evaluate import estimate_token_count
+
+    content = msg.get("content") or ""
+    if not isinstance(content, str):
+        content = json.dumps(content)
+    total = estimate_token_count(content)
+    if msg.get("tool_calls"):
+        total += estimate_token_count(json.dumps(msg["tool_calls"]))
+    return total
+
+
+def cap_conversation_length(
+    conversation: dict[str, Any],
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+) -> tuple[dict[str, Any], bool]:
+    """Truncate a conversation to a token budget at a safe boundary.
+
+    Measured on a 522-session corpus, only 37% of records fit a 32k
+    context and the largest was ~3.8M estimated tokens, so an uncapped
+    dataset silently relies on whatever the trainer does when a sample
+    overflows.
+
+    Truncation keeps a *prefix* of the conversation rather than dropping
+    the record: a prefix of an agent trajectory is itself a valid
+    trajectory, whereas dropping loses the long multi-step sessions that
+    are the most valuable training signal. The system message is always
+    retained (it carries the embedded tool schemas), and
+    :func:`remove_orphaned_tool_calls` runs afterwards so the cut can
+    never leave an assistant ``tool_calls`` entry without its matching
+    result.
+
+    Token counts use the same ``estimate_token_count`` heuristic as the
+    scorer, which over-estimates relative to a real BPE tokenizer. The
+    cap is therefore conservative — output fits the budget with room to
+    spare rather than landing just over it.
+
+    Returns ``(conversation, was_truncated)``.
+    """
+    messages = conversation.get("messages", [])
+    if not messages:
+        return conversation, False
+
+    kept: list[dict[str, Any]] = []
+    used = 0
+    for i, msg in enumerate(messages):
+        cost = _message_token_cost(msg)
+        # Always keep the first message even if it alone blows the budget;
+        # a record with no system turn is worse than one that is oversized.
+        if i > 0 and used + cost > max_tokens:
+            break
+        kept.append(msg)
+        used += cost
+
+    if len(kept) == len(messages):
+        return conversation, False
+
+    # Ending on a tool result gives the model nothing to predict, but dropping
+    # that turn can orphan the assistant call before it — and removing *that*
+    # can expose another trailing tool result. Alternate until stable.
+    while kept:
+        while kept and kept[-1].get("role") == "tool":
+            kept.pop()
+        pruned = remove_orphaned_tool_calls(kept)
+        if len(pruned) == len(kept):
+            kept = pruned
+            break
+        kept = pruned
+
+    return {**conversation, "messages": kept}, True
+
+
 def format_for_training(conversation: dict[str, Any]) -> dict[str, Any]:
     """Prepare a conversation record for ``trainer.py`` consumption.
 
