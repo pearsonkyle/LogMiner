@@ -173,27 +173,34 @@ _ENV_SECRET_RX = re.compile(
     re.IGNORECASE,
 )
 
+# Prefix-anchored credential patterns must not match *inside* a longer
+# token. Without this, `sk-` fired in the middle of ordinary strings —
+# `.../fix-actress/zask-…` and `…/card/j22/47/zask-…` were redacted as
+# OpenAI keys, swallowing 20+ characters of a legitimate path. `\b` is not
+# enough here because `_` and `-` are common in the surrounding text.
+_TOKEN_L = r"(?<![A-Za-z0-9_-])"
+
 PATTERNS = [
     (
         "jwt_token",
-        re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),
+        re.compile(_TOKEN_L + r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),
     ),
-    ("anthropic_api_key", re.compile(r"sk-ant-[A-Za-z0-9_-]{20,}")),
+    ("anthropic_api_key", re.compile(_TOKEN_L + r"sk-ant-[A-Za-z0-9_-]{20,}")),
     (
         # OpenAI: sk-..., sk-proj-..., sk-svcacct-..., sk-admin-...
         "openai_api_key",
-        re.compile(r"sk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])"),
+        re.compile(_TOKEN_L + r"sk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])"),
     ),
-    ("google_api_key", re.compile(r"AIzaSy[A-Za-z0-9_-]{33}")),
-    ("google_oauth_client_secret", re.compile(r"GOCSPX-[A-Za-z0-9_-]{20,}")),
-    ("github_token", re.compile(r"gh[posr]_[A-Za-z0-9]{36}")),
+    ("google_api_key", re.compile(_TOKEN_L + r"AIzaSy[A-Za-z0-9_-]{33}")),
+    ("google_oauth_client_secret", re.compile(_TOKEN_L + r"GOCSPX-[A-Za-z0-9_-]{20,}")),
+    ("github_token", re.compile(_TOKEN_L + r"gh[posr]_[A-Za-z0-9]{36}")),
     # Fine-grained PATs: github_pat_<22 chars>_<59 chars>
-    ("github_fine_pat", re.compile(r"github_pat_[A-Za-z0-9_]{20,}")),
-    ("gitlab_pat", re.compile(r"glpat-[A-Za-z0-9_-]{20,}")),
-    ("huggingface_token", re.compile(r"hf_[A-Za-z0-9]{20,}")),
-    ("aws_access_key", re.compile(r"AKIA[A-Z0-9]{16}")),
-    ("slack_token", re.compile(r"xox[bpsa]-[A-Za-z0-9-]{10,}")),
-    ("stripe_secret_key", re.compile(r"(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{20,}")),
+    ("github_fine_pat", re.compile(_TOKEN_L + r"github_pat_[A-Za-z0-9_]{20,}")),
+    ("gitlab_pat", re.compile(_TOKEN_L + r"glpat-[A-Za-z0-9_-]{20,}")),
+    ("huggingface_token", re.compile(_TOKEN_L + r"hf_[A-Za-z0-9]{20,}")),
+    ("aws_access_key", re.compile(_TOKEN_L + r"AKIA[A-Z0-9]{16}")),
+    ("slack_token", re.compile(_TOKEN_L + r"xox[bpsa]-[A-Za-z0-9-]{10,}")),
+    ("stripe_secret_key", re.compile(_TOKEN_L + r"(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{20,}")),
     ("npm_token", re.compile(r"\bnpm_[A-Za-z0-9]{36,}")),
     ("pypi_token", re.compile(r"\bpypi-AgE[A-Za-z0-9_-]{50,}")),
     ("sendgrid_api_key", re.compile(r"\bSG\.[A-Za-z0-9_-]{20,24}\.[A-Za-z0-9_-]{40,50}\b")),

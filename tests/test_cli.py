@@ -218,6 +218,7 @@ def test_cmd_filter_uploads_when_hf_repo_is_set(tmp_path, monkeypatch):
             output=str(output_path),
             min_score=0.5,
             max_tokens=131072,
+            keep_system_boilerplate=True,
             hf_repo="me/data",
             hf_private=True,
         )
@@ -245,6 +246,7 @@ def test_cmd_run_passes_hf_repo_to_filter(tmp_path, monkeypatch):
             output=str(tmp_path / "training.jsonl"),
             min_score=0.5,
             max_tokens=131072,
+            keep_system_boilerplate=True,
             hf_repo="me/data",
             hf_private=True,
         )

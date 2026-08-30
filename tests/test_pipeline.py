@@ -3,8 +3,10 @@
 import json
 
 from logminer.pipeline.cleanup import (
+    BOILERPLATE_MARKER,
     cap_conversation_length,
     clean_conversation,
+    condense_system_prompts,
     format_for_training,
     has_failed_command,
 )
@@ -881,3 +883,126 @@ class TestCapConversationLength:
         before = len(conv["messages"])
         cap_conversation_length(conv, max_tokens=5000)
         assert len(conv["messages"]) == before
+
+
+# ---------------------------------------------------------------------------
+# System-prompt boilerplate
+# ---------------------------------------------------------------------------
+
+
+class TestCondenseSystemPrompts:
+    """Agent CLIs ship a large fixed system prompt — 12.6k chars for Claude
+    Code, 24.3k for Qwen Code, 8.2% of the corpus. Identical in every sample,
+    it carries no discriminative signal and only consumes context."""
+
+    BOILER = (
+        "You are Agent.\n"
+        + "Always be careful and deliberate about every single action. " * 8
+        + "\nNever guess URLs. " * 8
+        + "\nUse tools well and prefer dedicated tools over shell. " * 8
+    )
+
+    def _records(self, n=10, source="claude"):
+        return [
+            {
+                "id": f"c{i}",
+                "source": source,
+                "messages": [
+                    {"role": "system", "content": f"{self.BOILER}\ncwd: /home/u{i}/proj{i}"},
+                    {"role": "user", "content": "go"},
+                ],
+            }
+            for i in range(n)
+        ]
+
+    def test_shared_lines_collapsed_to_marker(self):
+        out, stats = condense_system_prompts(self._records())
+        content = out[0]["messages"][0]["content"]
+        assert BOILERPLATE_MARKER in content
+        assert "Never guess URLs." not in content
+        assert stats["records_condensed"] == 10
+        assert stats["chars_removed"] > 0
+
+    def test_session_specific_lines_kept(self):
+        """env / CLAUDE.md / git status vary and do condition behaviour."""
+        out, _ = condense_system_prompts(self._records())
+        for i, rec in enumerate(out):
+            assert f"cwd: /home/u{i}/proj{i}" in rec["messages"][0]["content"]
+
+    def test_first_line_always_preserved(self):
+        """It names the agent — the one piece worth conditioning on."""
+        out, _ = condense_system_prompts(self._records())
+        assert out[0]["messages"][0]["content"].startswith("You are Agent.")
+
+    def test_small_groups_untouched(self):
+        """Under a handful of sessions there is no corpus-wide frequency."""
+        recs = self._records(n=3)
+        out, stats = condense_system_prompts(recs)
+        assert stats["records_condensed"] == 0
+        assert out == recs
+
+    def test_sources_grouped_independently(self):
+        recs = self._records(6, "claude") + [
+            {
+                "id": f"q{i}",
+                "source": "qwen",
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "You are Qwen.\n" + ("Qwen rule. " * 20) + f"\ndir {i}",
+                    },
+                    {"role": "user", "content": "go"},
+                ],
+            }
+            for i in range(6)
+        ]
+        out, _ = condense_system_prompts(recs)
+        assert out[0]["messages"][0]["content"].startswith("You are Agent.")
+        assert out[6]["messages"][0]["content"].startswith("You are Qwen.")
+        assert "Qwen rule. Qwen rule." not in out[6]["messages"][0]["content"]
+
+    def test_records_not_mutated(self):
+        recs = self._records()
+        before = recs[0]["messages"][0]["content"]
+        condense_system_prompts(recs)
+        assert recs[0]["messages"][0]["content"] == before
+
+    def test_records_without_system_message_skipped(self):
+        recs = [
+            {"id": "x", "source": "claude", "messages": [{"role": "user", "content": "hi"}]}
+        ] * 6
+        out, stats = condense_system_prompts(recs)
+        assert stats["records_condensed"] == 0
+        assert out == recs
+
+
+class TestCondenseMarkerFormatting:
+    def _recs(self, n=8):
+        boiler_a = "Rule one is long enough to matter here. " * 6
+        boiler_b = "Rule two is also long enough to matter. " * 6
+        return [
+            {
+                "id": f"c{i}",
+                "source": "claude",
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": f"You are Agent.\n{boiler_a}\n\n{boiler_b}\n\ncwd: /home/u{i}",
+                    },
+                    {"role": "user", "content": "go"},
+                ],
+            }
+            for i in range(n)
+        ]
+
+    def test_blank_lines_do_not_split_one_block_into_many_markers(self):
+        """Blank lines are never 'static', so without absorbing them a single
+        boilerplate block came out as marker/blank/marker/blank/marker."""
+        out, _ = condense_system_prompts(self._recs())
+        content = out[0]["messages"][0]["content"]
+        assert content.count(BOILERPLATE_MARKER) == 1, content
+
+    def test_separator_kept_before_resuming_content(self):
+        out, _ = condense_system_prompts(self._recs())
+        content = out[0]["messages"][0]["content"]
+        assert content.endswith("\n\ncwd: /home/u0")

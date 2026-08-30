@@ -309,10 +309,24 @@ def _to_arrow_safe(record: dict[str, Any]) -> dict[str, Any]:
 
 
 def cmd_filter(args: argparse.Namespace) -> None:
-    from logminer.pipeline.cleanup import cap_conversation_length, format_for_training
+    from logminer.pipeline.cleanup import (
+        cap_conversation_length,
+        condense_system_prompts,
+        format_for_training,
+    )
 
     records = _load_jsonl(Path(args.input))
     filtered = [r for r in records if r.get("score", 0) >= args.min_score]
+
+    # Condense before capping, so the freed context budget goes to the
+    # trajectory rather than to instructions identical in every sample.
+    if not args.keep_system_boilerplate:
+        filtered, boiler = condense_system_prompts(filtered)
+        if boiler["records_condensed"]:
+            print(
+                f"Condensed system boilerplate in {boiler['records_condensed']} records "
+                f"({boiler['chars_removed'] / 1e6:.1f}M chars removed)"
+            )
 
     truncated = 0
     capped = []
@@ -485,6 +499,7 @@ def cmd_run(args: argparse.Namespace) -> None:
                 str(args.min_score),
                 "--max-tokens",
                 str(args.max_tokens),
+                *(["--keep-system-boilerplate"] if args.keep_system_boilerplate else []),
                 *(["--hf-repo", args.hf_repo] if args.hf_repo else []),
                 *(["--hf-private"] if args.hf_private else []),
             ]
@@ -532,6 +547,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_filter.add_argument("--output", required=True)
     p_filter.add_argument("--min-score", type=float, default=0.5)
     p_filter.add_argument(
+        "--keep-system-boilerplate",
+        action="store_true",
+        help=(
+            "Keep the full agent system prompt. By default the lines shared by "
+            "≥90%% of a source's system prompts are collapsed to a marker, since "
+            "text identical in every sample carries no training signal; "
+            "session-specific context (env, CLAUDE.md, git status) is always kept"
+        ),
+    )
+    p_filter.add_argument(
         "--max-tokens",
         type=int,
         default=DEFAULT_MAX_TOKENS,
@@ -567,6 +592,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--input", default=None)
     p_run.add_argument("--output", required=True)
     p_run.add_argument("--min-score", type=float, default=0.5)
+    p_run.add_argument(
+        "--keep-system-boilerplate",
+        action="store_true",
+        help="Keep the full agent system prompt instead of condensing shared boilerplate",
+    )
     p_run.add_argument(
         "--max-tokens",
         type=int,

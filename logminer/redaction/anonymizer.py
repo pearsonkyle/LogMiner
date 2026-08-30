@@ -83,6 +83,126 @@ _UNBOUNDED_USERNAME_MIN_LEN = 6
 # substitute — replacing every occurrence of "ai" would shred the text.
 _BARE_TOKEN_MIN_LEN = 5
 
+# A directory name only earns bare-word replacement if its *shape* marks it
+# as a specific project rather than an ordinary word: an internal capital,
+# a digit, or a `-`/`_`/`.` separator. `DeckDoctor`, `Card-Agent` and
+# `Quant-Tuner` qualify; `tools`, `server` and `github` do not.
+#
+# Without this rule, harvesting directory names corpus-wide turned 96
+# ordinary words into substitution targets and rewrote them *everywhere* —
+# every Claude Code system prompt came out with "tools" replaced by a
+# BIP-39 pair ("- envelope-luxury are executed in a user-selected
+# permission mode"), "dev server" as "dev pigeon", and github.com as a
+# generated hostname. Renaming inside a path is always safe; rewriting a
+# bare English word is not.
+_DISTINCTIVE_SHAPE_RX = re.compile(r"[A-Z0-9]|[-_.]")
+
+# Shape alone is not enough: `~/Library/Frameworks` and `~/dev/Video-Tools`
+# both look distinctive but name nothing personal. These are checked
+# case-insensitively and never bare-replaced.
+_GENERIC_DIR_WORDS = frozenset(
+    {
+        "agents", "android", "api", "apis", "application", "applications",
+        "assets", "backend", "backends", "backup", "backups", "benchmark",
+        "benchmarks", "bin", "build", "builds", "cache", "caches", "checkpoint",
+        "checkpoints", "cli", "client", "clients", "components", "conda",
+        "config", "configs", "containers", "contrib", "core", "dashboard",
+        "data", "database", "datasets", "demo", "demos", "deploy", "dist",
+        "django", "docker", "docs", "documentation", "download", "downloads",
+        "eval", "evals", "example", "examples", "extensions", "fixtures",
+        "flask", "fonts", "frameworks", "frontend", "games", "github", "gitlab",
+        "group", "helpers", "homebrew", "html", "huggingface", "images",
+        "include", "index", "internal", "ios", "javascript", "keychains",
+        "kubernetes", "libraries", "library", "linux", "logs", "macos", "main",
+        "makefile", "media", "memories", "migrations", "mobile", "models",
+        "modules", "node_modules", "notebook", "notebooks", "notes", "output",
+        "outputs", "packages", "pipeline", "pipelines", "plugins", "prompts",
+        "public", "pytorch", "python", "reports", "resources", "results",
+        "samples", "schemas", "scripts", "server", "servers", "service",
+        "services", "shared", "snapshots", "source", "sources", "static",
+        "styles", "system", "target", "template", "templates", "tensorflow",
+        "test", "tests", "themes", "tmp", "tools", "training", "types",
+        "utils", "vendor", "web", "website", "widgets", "windows",
+    }
+)  # fmt: skip
+
+
+# Filenames are not identity, but their shape (a dot, often capitals) reads
+# as distinctive. `CLAUDE.md` sitting at the top of a project got harvested
+# and then rewritten everywhere, so Claude Code's own system prompt came out
+# reading "durable instructions like clerk files". Segments carrying a known
+# file extension are neither renamed inside paths nor bare-replaced.
+_KNOWN_FILE_EXTENSIONS = (
+    ".md",
+    ".txt",
+    ".rst",
+    ".json",
+    ".jsonl",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".ini",
+    ".cfg",
+    ".conf",
+    ".lock",
+    ".log",
+    ".csv",
+    ".tsv",
+    ".xml",
+    ".html",
+    ".css",
+    ".py",
+    ".pyi",
+    ".js",
+    ".jsx",
+    ".ts",
+    ".tsx",
+    ".rs",
+    ".go",
+    ".rb",
+    ".java",
+    ".c",
+    ".h",
+    ".cpp",
+    ".hpp",
+    ".swift",
+    ".kt",
+    ".sh",
+    ".bash",
+    ".zsh",
+    ".sql",
+    ".env",
+    ".pdf",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".svg",
+    ".ipynb",
+    ".gguf",
+    ".safetensors",
+    ".bin",
+    ".pt",
+    ".ckpt",
+    ".zip",
+    ".tar",
+    ".gz",
+)
+
+
+def _is_filename(original: str) -> bool:
+    return original.lower().endswith(_KNOWN_FILE_EXTENSIONS)
+
+
+def _is_distinctive_name(original: str) -> bool:
+    """True if a directory name looks like a specific project, not a word."""
+    if original.lower() in _GENERIC_DIR_WORDS or _is_filename(original):
+        return False
+    # Ignore a leading capital ("Programs") — only an *internal* capital,
+    # a digit, or a separator signals a project name.
+    return bool(_DISTINCTIVE_SHAPE_RX.search(original[1:]))
+
+
 # Bare-token boundaries use explicit lookarounds rather than `\b` so that
 # `_` counts as a boundary: MCP tool names embed the project name as
 # `mcp__deckdoctor__lookup_card_by_name`, and `\b` does not match between
@@ -132,10 +252,15 @@ def harvest_identities(s: str) -> tuple[set[str], set[str]]:
     for match in _HOME_PATH_RX.finditer(s):
         users.add(match.group("user").lower())
         for segment in (match.group("rest") or "").split("/")[1:]:
-            if segment and segment not in (".", "..") and segment.lower() not in _SYSTEM_DIRS:
-                projects.add(segment.lower())
+            if (
+                segment
+                and segment not in (".", "..")
+                and segment.lower() not in _SYSTEM_DIRS
+                and not _is_filename(segment)
+            ):
+                projects.add(segment)
     for match in _MCP_TOOL_RX.finditer(s):
-        projects.add(match.group(2).lower())
+        projects.add(match.group(2))
     return users, projects
 
 
@@ -168,6 +293,7 @@ class Anonymizer:
         self._extra = [u for u in (extra_usernames or []) if u]
         self._user_map: dict[str, str] = {}
         self._project_map: dict[str, str] = {}
+        self._project_distinctive: dict[str, bool] = {}
         self._bare_rx: re.Pattern[str] | None = None
         self._bare_dirty = True
         # Seed the maps so names harvested elsewhere in the corpus are
@@ -208,6 +334,15 @@ class Anonymizer:
         # in a path and `mcp__deckdoctor__lookup` in a tool name, and both
         # must resolve to the same replacement.
         key = original.lower()
+        # Distinctiveness is a property of any spelling ever seen: a project
+        # observed as `DeckDoctor` in a path is still identifying when it
+        # shows up lowercased in `mcp__deckdoctor__lookup`.
+        if _is_distinctive_name(original):
+            if not self._project_distinctive.get(key):
+                self._project_distinctive[key] = True
+                self._bare_dirty = True
+        else:
+            self._project_distinctive.setdefault(key, False)
         if key not in self._project_map:
             n = self._digest("project", key)
             words = _wordlist()
@@ -233,6 +368,10 @@ class Anonymizer:
 
     def _rewrite_segment(self, segment: str) -> str:
         if not segment or segment in (".", "..") or segment.lower() in _SYSTEM_DIRS:
+            return segment
+        # A filename is not identity, and rewriting it would desynchronize
+        # the path from the file contents quoted alongside it.
+        if _is_filename(segment):
             return segment
         return self._fake_project(segment)
 
@@ -270,7 +409,9 @@ class Anonymizer:
             names = [
                 n
                 for n in self._project_map
-                if len(n) >= _BARE_TOKEN_MIN_LEN and n.lower() not in _SYSTEM_DIRS
+                if len(n) >= _BARE_TOKEN_MIN_LEN
+                and n.lower() not in _SYSTEM_DIRS
+                and self._project_distinctive.get(n)
             ]
             # Longest first so `Card-Agent` wins over a hypothetical `Card`.
             names.sort(key=len, reverse=True)
