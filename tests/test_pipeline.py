@@ -3,7 +3,10 @@
 import json
 
 from logminer.pipeline.cleanup import (
+    BOILERPLATE_MARKER,
+    cap_conversation_length,
     clean_conversation,
+    condense_system_prompts,
     format_for_training,
     has_failed_command,
 )
@@ -529,6 +532,36 @@ def _agentic_conversation(
     return {"id": "synth", "source": "claude", "messages": messages}
 
 
+def test_scorer_recognizes_cline_file_edit_tools():
+    conversation = {
+        "id": "cline-edit",
+        "source": "cline",
+        "messages": [
+            {"role": "user", "content": "Please update the implementation." * 100},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "r", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}
+                ],
+            },
+            {"role": "tool", "tool_call_id": "r", "content": "source"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "w", "type": "function", "function": {"name": "replace_in_file", "arguments": "{}"}}
+                ],
+            },
+            {"role": "tool", "tool_call_id": "w", "content": "updated"},
+        ],
+    }
+
+    result = evaluate_conversation(conversation, min_token_count=1)
+
+    assert "editchain:1.00" in result["reasons"]
+
+
 class TestScoreSemantics:
     """Behavioral assertions for the agent-SFT scorer.
 
@@ -721,7 +754,7 @@ class TestCleanerBoundaries:
     def test_plan_approval_text_kept(self):
         """Claude's plan-approval system message must survive cleaning."""
         content = (
-            "User has approved your plan. You can now start coding. " "Start with the first todo."
+            "User has approved your plan. You can now start coding. Start with the first todo."
         )
         assert has_failed_command(content) is False
 
@@ -805,3 +838,201 @@ class TestCleanerBoundaries:
             assert m["role"] != "tool"
             if m["role"] == "assistant":
                 assert not m.get("tool_calls")
+
+
+# ---------------------------------------------------------------------------
+# Length capping
+# ---------------------------------------------------------------------------
+
+
+class TestCapConversationLength:
+    """Only 37% of a real 522-session corpus fit a 32k context and the
+    largest record was ~3.8M estimated tokens, so an uncapped dataset
+    silently depends on the trainer's overflow behaviour. Truncation keeps
+    a prefix (still a valid trajectory) rather than dropping the record.
+    """
+
+    def _long_conv(self, n_pairs=40):
+        messages = [{"role": "system", "content": "sys"}, {"role": "user", "content": "go"}]
+        for i in range(n_pairs):
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {"id": f"c{i}", "function": {"name": "Bash", "arguments": "{}"}}
+                    ],
+                }
+            )
+            messages.append({"role": "tool", "tool_call_id": f"c{i}", "content": "x" * 4000})
+        return {"id": "long", "messages": messages}
+
+    def test_short_conversation_untouched(self):
+        conv = {"id": "s", "messages": [{"role": "user", "content": "hi"}]}
+        out, truncated = cap_conversation_length(conv, max_tokens=131072)
+        assert truncated is False
+        assert out == conv
+
+    def test_long_conversation_truncated(self):
+        out, truncated = cap_conversation_length(self._long_conv(), max_tokens=5000)
+        assert truncated is True
+        assert len(out["messages"]) < len(self._long_conv()["messages"])
+
+    def test_system_message_always_kept(self):
+        out, _ = cap_conversation_length(self._long_conv(), max_tokens=10)
+        assert out["messages"][0]["role"] == "system"
+
+    def test_truncation_leaves_no_orphaned_tool_calls(self):
+        """A cut mid-pair must not leave a tool_call without its result."""
+        for budget in (500, 2000, 5000, 20000, 50000):
+            out, _ = cap_conversation_length(self._long_conv(), max_tokens=budget)
+            result_ids = {m.get("tool_call_id") for m in out["messages"] if m.get("role") == "tool"}
+            for m in out["messages"]:
+                for tc in m.get("tool_calls") or []:
+                    assert tc["id"] in result_ids, f"orphaned call at budget={budget}"
+
+    def test_truncation_does_not_end_on_tool_result(self):
+        """Only applies when a cut was made — an untruncated record keeps
+        whatever shape the session actually had."""
+        for budget in (500, 2000, 5000, 20000):
+            out, truncated = cap_conversation_length(self._long_conv(), max_tokens=budget)
+            assert truncated is True
+            if out["messages"]:
+                assert out["messages"][-1]["role"] != "tool", f"ends on tool at budget={budget}"
+
+    def test_output_respects_budget(self):
+        from logminer.pipeline.evaluate import estimate_token_count
+
+        budget = 20000
+        out, _ = cap_conversation_length(self._long_conv(), max_tokens=budget)
+        total = sum(estimate_token_count(m.get("content") or "") for m in out["messages"])
+        assert total <= budget
+
+    def test_original_record_not_mutated(self):
+        conv = self._long_conv()
+        before = len(conv["messages"])
+        cap_conversation_length(conv, max_tokens=5000)
+        assert len(conv["messages"]) == before
+
+
+# ---------------------------------------------------------------------------
+# System-prompt boilerplate
+# ---------------------------------------------------------------------------
+
+
+class TestCondenseSystemPrompts:
+    """Agent CLIs ship a large fixed system prompt — 12.6k chars for Claude
+    Code, 24.3k for Qwen Code, 8.2% of the corpus. Identical in every sample,
+    it carries no discriminative signal and only consumes context."""
+
+    BOILER = (
+        "You are Agent.\n"
+        + "Always be careful and deliberate about every single action. " * 8
+        + "\nNever guess URLs. " * 8
+        + "\nUse tools well and prefer dedicated tools over shell. " * 8
+    )
+
+    def _records(self, n=10, source="claude"):
+        return [
+            {
+                "id": f"c{i}",
+                "source": source,
+                "messages": [
+                    {"role": "system", "content": f"{self.BOILER}\ncwd: /home/u{i}/proj{i}"},
+                    {"role": "user", "content": "go"},
+                ],
+            }
+            for i in range(n)
+        ]
+
+    def test_shared_lines_collapsed_to_marker(self):
+        out, stats = condense_system_prompts(self._records())
+        content = out[0]["messages"][0]["content"]
+        assert BOILERPLATE_MARKER in content
+        assert "Never guess URLs." not in content
+        assert stats["records_condensed"] == 10
+        assert stats["chars_removed"] > 0
+
+    def test_session_specific_lines_kept(self):
+        """env / CLAUDE.md / git status vary and do condition behaviour."""
+        out, _ = condense_system_prompts(self._records())
+        for i, rec in enumerate(out):
+            assert f"cwd: /home/u{i}/proj{i}" in rec["messages"][0]["content"]
+
+    def test_first_line_always_preserved(self):
+        """It names the agent — the one piece worth conditioning on."""
+        out, _ = condense_system_prompts(self._records())
+        assert out[0]["messages"][0]["content"].startswith("You are Agent.")
+
+    def test_small_groups_untouched(self):
+        """Under a handful of sessions there is no corpus-wide frequency."""
+        recs = self._records(n=3)
+        out, stats = condense_system_prompts(recs)
+        assert stats["records_condensed"] == 0
+        assert out == recs
+
+    def test_sources_grouped_independently(self):
+        recs = self._records(6, "claude") + [
+            {
+                "id": f"q{i}",
+                "source": "qwen",
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "You are Qwen.\n" + ("Qwen rule. " * 20) + f"\ndir {i}",
+                    },
+                    {"role": "user", "content": "go"},
+                ],
+            }
+            for i in range(6)
+        ]
+        out, _ = condense_system_prompts(recs)
+        assert out[0]["messages"][0]["content"].startswith("You are Agent.")
+        assert out[6]["messages"][0]["content"].startswith("You are Qwen.")
+        assert "Qwen rule. Qwen rule." not in out[6]["messages"][0]["content"]
+
+    def test_records_not_mutated(self):
+        recs = self._records()
+        before = recs[0]["messages"][0]["content"]
+        condense_system_prompts(recs)
+        assert recs[0]["messages"][0]["content"] == before
+
+    def test_records_without_system_message_skipped(self):
+        recs = [
+            {"id": "x", "source": "claude", "messages": [{"role": "user", "content": "hi"}]}
+        ] * 6
+        out, stats = condense_system_prompts(recs)
+        assert stats["records_condensed"] == 0
+        assert out == recs
+
+
+class TestCondenseMarkerFormatting:
+    def _recs(self, n=8):
+        boiler_a = "Rule one is long enough to matter here. " * 6
+        boiler_b = "Rule two is also long enough to matter. " * 6
+        return [
+            {
+                "id": f"c{i}",
+                "source": "claude",
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": f"You are Agent.\n{boiler_a}\n\n{boiler_b}\n\ncwd: /home/u{i}",
+                    },
+                    {"role": "user", "content": "go"},
+                ],
+            }
+            for i in range(n)
+        ]
+
+    def test_blank_lines_do_not_split_one_block_into_many_markers(self):
+        """Blank lines are never 'static', so without absorbing them a single
+        boilerplate block came out as marker/blank/marker/blank/marker."""
+        out, _ = condense_system_prompts(self._recs())
+        content = out[0]["messages"][0]["content"]
+        assert content.count(BOILERPLATE_MARKER) == 1, content
+
+    def test_separator_kept_before_resuming_content(self):
+        out, _ = condense_system_prompts(self._recs())
+        content = out[0]["messages"][0]["content"]
+        assert content.endswith("\n\ncwd: /home/u0")

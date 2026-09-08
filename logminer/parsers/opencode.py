@@ -3,7 +3,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from logminer.parsers.base import BaseParser, build_tool_schema
+from logminer.parsers.base import BaseParser, build_tool_schema, normalize_tool_arguments
 
 _BUNDLED_PROMPT_DIR = Path(__file__).parent / "opencode_prompts"
 _USER_SYSTEM_PROMPT = Path.home() / ".local" / "share" / "opencode" / "system.md"
@@ -142,7 +142,7 @@ class OpenCodeParser(BaseParser):
                 elif ptype == "tool":
                     tool_name = part_data.get("tool", "")
                     state = part_data.get("state", {})
-                    inp = state.get("input", {})
+                    inp = normalize_tool_arguments(state.get("input"))
                     status = state.get("status", "")
                     output = state.get("output", "")
                     tool_id = part_data.get("id", f"call_{len(tool_calls)}")
@@ -176,10 +176,10 @@ class OpenCodeParser(BaseParser):
                     conversation.append({"role": "user", "content": user_text})
 
             elif role == "assistant":
-                asst_msg: dict[str, Any] = {"role": "assistant"}
+                # Tool-only turns need an explicit empty content value for
+                # consistent chat-template rendering across all parsers.
                 combined = "\n".join(text_parts).strip()
-                if combined:
-                    asst_msg["content"] = combined
+                asst_msg: dict[str, Any] = {"role": "assistant", "content": combined}
                 if tool_calls:
                     asst_msg["tool_calls"] = tool_calls
                 if "content" in asst_msg or "tool_calls" in asst_msg:

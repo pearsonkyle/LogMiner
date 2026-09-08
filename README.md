@@ -1,7 +1,7 @@
 # logminer
 
-A Python CLI for turning raw coding-agent session logs (Claude Code, OpenCode,
-Qwen Code) into clean, redacted, quality-scored JSONL that loads directly into
+A Python CLI for turning raw coding-agent session logs (Claude Code, Cline, Codex,
+OpenCode, Qwen Code) into clean, redacted, quality-scored JSONL that loads directly into
 a HuggingFace SFT pipeline.
 
 The pipeline is a chain of JSONL → JSONL stages. Each stage has its own
@@ -63,11 +63,19 @@ export HF_TOKEN=hf_xxx
 python -m logminer run --source claude --output training.jsonl --hf-repo your-name/logminer-data
 ```
 
-When upload runs, logminer also writes a dataset-card `README.md` with a
-consistent `logminer` tag and a link back to this GitHub repo so those datasets
-are easier to find on Hugging Face.
+The dataset always lands at `data/train.jsonl` in the repo regardless of your
+local `--output` name, so repeated uploads replace it rather than piling up
+extra files that `load_dataset()` would glob into one duplicated split.
 
-Pass `--hf-private` if you want the dataset repo created as private.
+On first upload logminer seeds a dataset-card `README.md` with a consistent
+`logminer` tag and a link back to this GitHub repo, so those datasets are
+easier to find on Hugging Face. If the repo already has a `README.md` it is
+left alone — a hand-written card survives re-uploads.
+
+Pass `--hf-private` to make the dataset repo private; it is applied to
+existing repos too, not just newly created ones. If you pass `--hf-repo`
+without a token in the environment, the command fails rather than exiting 0
+with nothing published.
 
 If you already ran the earlier stages yourself, `filter` can upload the final
 JSONL too:
@@ -89,6 +97,8 @@ When you omit `--input`, the parser falls back to each provider's standard
 directory:
 
 - **claude** → `~/.claude/projects`
+- **cline** → `~/Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/tasks`
+- **codex** → `~/.codex/sessions`
 - **opencode** → `~/.local/share/opencode`
 - **qwen** → `~/.qwen/projects`
 
@@ -99,6 +109,10 @@ Pass `--input <path>` to point at a specific export instead.
 - **`--min-score`** — 0.5 is the default and is forgiving. Raise to 0.7+ when
   you have plenty of source logs and want a tighter dataset; lower it when
   you're data-starved or still tuning.
+- **`--max-tokens`** — 131072 by default. Longer conversations are truncated
+  to a prefix (still a valid trajectory) rather than dropped, cutting at a
+  boundary that keeps every tool call paired with its result. Lower it to
+  match your training context window.
 - **`--min-turns` / `--min-token-count`** — what counts as a "real"
   conversation. The evaluator hard-floors anything below these to score 0,
   regardless of other signals. Drop them for sparse logs; raise them when you
@@ -148,6 +162,18 @@ for rec in ds:
 Adding a new agent (e.g. Codex) usually means one new file in
 `logminer/parsers/` plus a one-line entry in `parsers/__init__.py`. The
 pipeline stages are agent-agnostic and don't need changes.
+
+Codex is supported directly: its Responses API-style function-call and
+function-output items are normalized to paired assistant `tool_calls` and
+`tool` turns. Public reasoning summaries and older recoverable reasoning
+events are emitted in the same `<think>…</think>` convention as the other
+parsers; reasoning that Codex does not persist cannot be recovered.
+
+Cline task transcripts are supported directly. Its XML-like tool calls and
+bracketed tool results are normalized to paired assistant `tool_calls` and
+`tool` turns; `<think>` and `<thinking>` content is retained. To keep SFT
+examples tractable, extraction ends after the second `attempt_completion` or
+`task_complete` call in a task.
 
 See `SKILL.md` for the parser contract (`BaseParser`), step-by-step
 instructions, and notes on extending the redaction, scoring, and cleaning

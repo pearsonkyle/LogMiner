@@ -1,6 +1,6 @@
 """Tests for the redaction module."""
 
-from logminer.redaction.anonymizer import Anonymizer
+from logminer.redaction.anonymizer import Anonymizer, harvest_identities
 from logminer.redaction.secrets import redact_text, scan_text
 
 
@@ -77,7 +77,6 @@ def test_anonymizer_username_replacement(monkeypatch):
     anon = Anonymizer()
     result = anon.text("Hello from johndoe on this machine")
     assert "johndoe" not in result
-    assert "user_" in result
 
 
 def test_anonymizer_home_dir_replacement():
@@ -85,7 +84,6 @@ def test_anonymizer_home_dir_replacement():
     anon = Anonymizer()
     result = anon.text(f"file is at {home}/config.yaml")
     assert home not in result
-    assert "REDACTED_USER" in result
 
 
 def test_anonymizer_short_username_not_replaced(monkeypatch):
@@ -99,6 +97,82 @@ def test_anonymizer_extra_usernames():
     anon = Anonymizer(extra_usernames=["secretuser"])
     result = anon.text("path /home/secretuser/data")
     assert "secretuser" not in result
+
+
+# --- Per-session path variance -------------------------------------------
+
+
+def test_different_sessions_get_different_homes():
+    """The whole point of the rewrite: no single memorizable path literal."""
+    text = "/Users/alice/Programs/Widget/main.py"
+    outs = {Anonymizer(session_key=f"session-{i}").text(text) for i in range(25)}
+    assert len(outs) > 15, f"expected varied homes across sessions, got {len(outs)}"
+
+
+def test_same_session_is_internally_consistent():
+    """A trajectory that cds somewhere and later reads under it must agree."""
+    anon = Anonymizer(session_key="s1")
+    a = anon.text("cd /Users/alice/Programs/Widget")
+    b = anon.text("read /Users/alice/Programs/Widget/main.py")
+    assert a.split("cd ")[1] in b
+
+
+def test_anonymization_is_deterministic_for_a_key():
+    text = "/home/bob/Code/Thing/x.py"
+    assert Anonymizer(session_key="k").text(text) == Anonymizer(session_key="k").text(text)
+
+
+def test_non_local_home_is_anonymized():
+    """Exact-$HOME matching missed remote/homelab paths entirely."""
+    result = Anonymizer(session_key="s").text("model_path: /home/pearsonkyle/llm/gguf/m.gguf")
+    assert "pearsonkyle" not in result
+
+
+def test_system_dirs_preserved():
+    """Renaming ~/.claude/projects would make the transcript wrong, not private."""
+    result = Anonymizer(session_key="s").text("/Users/alice/.claude/projects/foo")
+    assert "/.claude/projects/" in result
+
+
+def test_deep_source_paths_untouched():
+    """Below three segments the path is source-tree structure, not identity.
+
+    Three is tuned to the real `~/Programs/<Org>/<Repo>/<package>/...`
+    layout: the container dir is preserved by name (`Programs` is a
+    system dir), org and repo are renamed, and the package directory is
+    left alone so it still matches the `from cardagent import ...` lines
+    quoted in the same transcript.
+    """
+    result = Anonymizer(session_key="s").text(
+        "/Users/alice/Programs/DeckDoctor/Card-Agent/cardagent/scripts/sim.py"
+    )
+    assert result.endswith("/cardagent/scripts/sim.py")
+    assert "DeckDoctor" not in result
+    assert "Card-Agent" not in result
+    assert "/Programs/" in result
+
+
+def test_project_name_replaced_outside_paths():
+    anon = Anonymizer(session_key="s")
+    anon.prescan("/Users/alice/Programs/DeckDoctor/x.py")
+    result = anon.text("the DeckDoctor repo and mcp__deckdoctor__lookup_card")
+    assert "eckdoctor" not in result.lower()
+
+
+def test_project_name_maps_consistently_across_casing():
+    """`DeckDoctor` in a path and `deckdoctor` in an MCP tool name are one project."""
+    anon = Anonymizer(session_key="s")
+    path_out = anon.text("/Users/alice/Programs/DeckDoctor")
+    bare_out = anon.text("mcp__deckdoctor__lookup")
+    fake = path_out.rsplit("/", 1)[1]
+    assert fake.lower() in bare_out.lower()
+
+
+def test_short_project_names_not_bare_replaced():
+    """Substituting every occurrence of a 2-char dir name would shred the text."""
+    anon = Anonymizer(session_key="s")
+    anon.prescan("/Users/alice/ai/notes.md")
+    assert "ai" in anon.text("this ai is a normal word in prose")
 
 
 def test_huggingface_token_detected():
@@ -268,9 +342,7 @@ def test_pgp_private_key_block_detected():
 
 
 def test_encrypted_pem_private_key_detected():
-    text = (
-        "-----BEGIN ENCRYPTED PRIVATE KEY-----\n" "MIIE...\n" "-----END ENCRYPTED PRIVATE KEY-----"
-    )
+    text = "-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIIE...\n-----END ENCRYPTED PRIVATE KEY-----"
     findings = scan_text(text)
     names = [f.pattern_name for f in findings]
     assert "private_key" in names
@@ -337,3 +409,193 @@ def test_long_digit_id_not_flagged_as_card():
     text = "transaction id: 123456789012345"
     findings = scan_text(text)
     assert all(f.pattern_name != "credit_card" for f in findings)
+
+
+def test_separated_card_redacted_without_keyword():
+    """4-4-4-4 grouping is corroboration on its own."""
+    redacted, count = redact_text("4532 0151 1283 0366")
+    assert count == 1
+    assert "4532" not in redacted
+
+
+# Regression: on a 522-session corpus every one of the 194 `credit_card`
+# hits was one of these two shapes, and the replacement landed *inside* a
+# number (`0.4848…` → `0.[REDACTED_CREDIT_CARD]`).
+
+
+def test_float_digits_not_flagged_as_card():
+    text = "{'recall@10': 0.691025641025641, 'mrr@10': 0.48486721611721617}"
+    redacted, count = redact_text(text)
+    assert count == 0
+    assert redacted == text
+
+
+def test_unix_ms_timestamp_not_flagged_as_card():
+    text = '"startedAt": 1787585109642, "queuedAt": 1787585109631, "attempt": 1'
+    _, count = redact_text(text)
+    assert count == 0
+
+
+def test_sha256_with_0x_prefix_not_flagged_as_eth_key():
+    text = "commit hash 0x" + "ab12cd34" * 8 + " verified"
+    findings = scan_text(text)
+    assert all(f.pattern_name != "ethereum_private_key" for f in findings)
+
+
+def test_eth_key_with_wallet_context_still_flagged():
+    text = "wallet private key: 0x" + "ac0974be" * 8
+    findings = scan_text(text)
+    assert "ethereum_private_key" in [f.pattern_name for f in findings]
+
+
+# --- Corpus-wide identity harvesting --------------------------------------
+
+
+def test_harvest_identities_from_path():
+    users, projects = harvest_identities("/Users/alice/Programs/DeckDoctor/main.py")
+    assert "alice" in users
+    assert "DeckDoctor" in projects
+    assert not any(x.lower() == "programs" for x in projects)  # generic container dir
+
+
+def test_harvest_identities_from_mcp_tool_name():
+    """The project leaks via MCP server names in sessions with no path to it."""
+    _, projects = harvest_identities('{"name": "mcp__deckdoctor__lookup_card"}')
+    assert "deckdoctor" in projects
+
+
+def test_mcp_server_name_anonymized():
+    anon = Anonymizer(session_key="s", extra_projects=["DeckDoctor"])
+    result = anon.text('{"name": "mcp__deckdoctor__lookup_card"}')
+    assert "deckdoctor" not in result
+    assert result.startswith('{"name": "mcp__')
+
+
+def test_extra_projects_substituted_without_local_evidence():
+    """A session that only mentions the project in prose still gets it."""
+    anon = Anonymizer(session_key="s", extra_projects=["DeckDoctor"])
+    assert "DeckDoctor" not in anon.text("bring this engine into DeckDoctor as a mode")
+
+
+def test_generic_account_names_not_bare_replaced():
+    """`/home/user` is a real home dir but "user" is not an identity."""
+    anon = Anonymizer(session_key="s", extra_usernames=["user", "claude", "runner"])
+    text = "the user asked claude to run it on a runner"
+    assert anon.text(text) == text
+
+
+def test_generic_account_home_still_path_anonymized():
+    result = Anonymizer(session_key="s").text("/home/user/Card-Agent/README.md")
+    assert "/home/user/" not in result
+
+
+def test_name_after_literal_escape_sequence_anonymized():
+    """Agent logs embed JSON in JSON, so a name can follow a literal `\\n`
+    (backslash + `n`) rather than a real newline. A plain word-boundary
+    lookbehind sees the `n` and skips the match."""
+    anon = Anonymizer(session_key="s", extra_projects=["card-agent"])
+    for prefix in ("\\n", "\\t", "\\r", "\n", " ", '"'):
+        assert "Card-Agent" not in anon.text(f"into{prefix}Card-Agent as a mode")
+
+
+def test_escape_boundary_does_not_match_mid_word():
+    anon = Anonymizer(session_key="s", extra_projects=["widget"])
+    assert anon.text("a superwidget here") == "a superwidget here"
+
+
+def test_long_username_glued_to_preceding_letter_still_replaced():
+    """Terminal logs mangle prompts: a real qwen session contained
+    `(llm) Akpearson:~/…` where a carriage-return overwrite glued the
+    username to a preceding letter, and a left boundary let it leak."""
+    anon = Anonymizer(session_key="s", extra_usernames=["kpearson"])
+    assert "kpearson" not in anon.text("(llm) Akpearson:~/Programs/ai$ ls").lower()
+
+
+def test_short_username_keeps_strict_boundary():
+    """Below 6 chars, substring matching would corrupt ordinary words."""
+    anon = Anonymizer(session_key="s", extra_usernames=["mark"])
+    assert anon.text("add a bookmark here") == "add a bookmark here"
+
+
+def test_username_prefix_of_longer_name_not_replaced():
+    """The right boundary still holds: `kpearsons` is a different name."""
+    anon = Anonymizer(session_key="s", extra_usernames=["kpearson"])
+    assert "kpearsons" in anon.text("the kpearsons account")
+
+
+# --- Prefix-anchored tokens must not match inside a longer string ---------
+
+
+def test_sk_prefix_inside_path_not_redacted():
+    """`sk-` fired mid-token on real data, redacting 20+ chars of a path:
+    `.../fix-actress/zask-...` became `.../fix-actress/za[REDACTED_...]`."""
+    text = "for D in fix-actress/zask-toss-abcdefghijklmnop/out.json"
+    redacted, count = redact_text(text)
+    assert count == 0
+    assert redacted == text
+
+
+def test_hf_prefix_inside_word_not_redacted():
+    text = "the shf_abcdefghijklmnopqrstuvwxyz variable"
+    _, count = redact_text(text)
+    assert count == 0
+
+
+def test_real_openai_key_still_redacted_after_boundary_fix():
+    for prefix in ("", "Authorization: ", "OPENAI_API_KEY=", '{"key": "'):
+        text = prefix + "sk-proj-abcdefghijklmnopqrstuvwxyz0123"
+        redacted, count = redact_text(text)
+        assert count >= 1, f"missed key with prefix {prefix!r}"
+        assert "sk-proj-abcdefghijkl" not in redacted
+
+
+# --- Bare-word replacement must not rewrite ordinary language ------------
+
+
+def test_generic_dir_names_not_bare_replaced():
+    """Harvesting dir names corpus-wide made `tools`, `server` and `github`
+    substitution targets, rewriting them everywhere. Every Claude Code
+    system prompt came out with "tools" replaced by a BIP-39 pair."""
+    anon = Anonymizer(session_key="s")
+    anon.prescan("/Users/alice/Programs/tools/x.py")
+    anon.prescan("/Users/alice/dev/server/y.py")
+    anon.prescan("/Users/alice/src/github/z.py")
+    text = (
+        " - tools are executed in a user-selected permission mode.\n"
+        " - start the dev server and use the feature in a browser.\n"
+        " - report the issue at https://github.com/anthropics/claude-code/issues"
+    )
+    assert anon.text(text) == text
+
+
+def test_generic_names_still_renamed_inside_paths():
+    """Renaming inside a path is always safe — only bare words are risky."""
+    out = Anonymizer(session_key="s").text("/Users/alice/Programs/tools/x.py")
+    assert "/Users/alice" not in out
+
+
+def test_distinctive_names_still_bare_replaced():
+    anon = Anonymizer(session_key="s")
+    for p in (
+        "/Users/alice/Programs/DeckDoctor",
+        "/Users/alice/x/Card-Agent",
+        "/Users/alice/y/Quant-Tuner",
+    ):
+        anon.prescan(p)
+    out = anon.text("bring DeckDoctor and Card-Agent into Quant-Tuner")
+    for name in ("DeckDoctor", "Card-Agent", "Quant-Tuner"):
+        assert name not in out
+
+
+def test_capitalized_generic_dir_not_bare_replaced():
+    """`~/Library/Frameworks` looks distinctive by shape but names nothing."""
+    anon = Anonymizer(session_key="s")
+    anon.prescan("/Users/alice/Library/Frameworks/a.framework")
+    assert "Frameworks" in anon.text("the Frameworks directory holds it")
+
+
+def test_distinctiveness_carries_across_casing():
+    """Seen as `DeckDoctor` in a path, still identifying lowercased."""
+    anon = Anonymizer(session_key="s")
+    anon.prescan("/Users/alice/Programs/DeckDoctor/x.py")
+    assert "deckdoctor" not in anon.text("the deckdoctor engine").lower()

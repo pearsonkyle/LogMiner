@@ -130,6 +130,181 @@ def clean_conversation(
     )
 
 
+DEFAULT_MAX_TOKENS = 131_072
+
+# A line must appear in at least this share of a source's system prompts to
+# count as boilerplate rather than session context.
+DEFAULT_BOILERPLATE_SHARE = 0.9
+# Below this many sessions there is no meaningful "corpus-wide" frequency,
+# so nothing is condensed.
+_MIN_GROUP_FOR_BOILERPLATE = 5
+
+BOILERPLATE_MARKER = "[... standard agent instructions elided ...]"
+
+
+def condense_system_prompts(
+    records: list[dict[str, Any]],
+    min_share: float = DEFAULT_BOILERPLATE_SHARE,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Collapse the boilerplate that every system prompt in a source shares.
+
+    Agent CLIs ship a large fixed system prompt — measured here at 12.6k
+    characters for Claude Code and 24.3k for Qwen Code, together 8.2% of the
+    corpus. Because it is byte-identical across sessions it carries no
+    discriminative signal: a model cannot learn "when the system prompt says
+    X, do Y" from a corpus where it always says X. It only consumes context
+    that the actual trajectory could use.
+
+    What *does* vary is the session context the CLI injects into the same
+    message — the environment block, the project's CLAUDE.md, git status.
+    That conditions behaviour and is kept verbatim.
+
+    So: group by ``source``, find the lines present in ``min_share`` of that
+    group's system prompts, and replace each contiguous run of them with a
+    single marker. The first line is always preserved — it names the agent,
+    which is the one piece of boilerplate worth conditioning on.
+
+    Returns ``(records, stats)``. Records are not mutated in place.
+    """
+    groups: dict[str, list[int]] = {}
+    for i, rec in enumerate(records):
+        messages = rec.get("messages") or []
+        if messages and messages[0].get("role") == "system":
+            groups.setdefault(rec.get("source", ""), []).append(i)
+
+    static_by_source: dict[str, set[str]] = {}
+    for source, idxs in groups.items():
+        if len(idxs) < _MIN_GROUP_FOR_BOILERPLATE:
+            continue
+        freq: dict[str, int] = {}
+        for i in idxs:
+            content = records[i]["messages"][0].get("content") or ""
+            for line in set(content.split("\n")):
+                freq[line] = freq.get(line, 0) + 1
+        threshold = min_share * len(idxs)
+        static_by_source[source] = {ln for ln, c in freq.items() if c >= threshold and ln.strip()}
+
+    out = list(records)
+    stats = {"records_condensed": 0, "chars_removed": 0}
+    for source, idxs in groups.items():
+        static = static_by_source.get(source)
+        if not static:
+            continue
+        for i in idxs:
+            rec = out[i]
+            messages = rec["messages"]
+            original = messages[0].get("content") or ""
+            condensed = _condense_lines(original, static)
+            if len(condensed) >= len(original):
+                continue
+            stats["records_condensed"] += 1
+            stats["chars_removed"] += len(original) - len(condensed)
+            new_first = {**messages[0], "content": condensed}
+            out[i] = {**rec, "messages": [new_first, *messages[1:]]}
+    return out, stats
+
+
+def _condense_lines(content: str, static: set[str]) -> str:
+    """Replace each contiguous run of ``static`` lines with one marker."""
+    lines = content.split("\n")
+    result: list[str] = []
+    in_run = False
+    for idx, line in enumerate(lines):
+        # Always keep the first line: it identifies the agent.
+        if idx == 0:
+            result.append(line)
+            continue
+        if line in static:
+            if not in_run:
+                result.append(BOILERPLATE_MARKER)
+                in_run = True
+            continue
+        # Blank lines are never "static" (they appear everywhere), so without
+        # this they would break one boilerplate block into a run of markers
+        # separated by blanks. Absorb them while inside a run, and re-emit a
+        # single separator when real content resumes.
+        if in_run and not line.strip():
+            continue
+        if in_run:
+            result.append("")
+            in_run = False
+        result.append(line)
+    return "\n".join(result)
+
+
+def _message_token_cost(msg: dict[str, Any]) -> int:
+    """Estimated tokens for one message, including its tool-call payload."""
+    from logminer.pipeline.evaluate import estimate_token_count
+
+    content = msg.get("content") or ""
+    if not isinstance(content, str):
+        content = json.dumps(content)
+    total = estimate_token_count(content)
+    if msg.get("tool_calls"):
+        total += estimate_token_count(json.dumps(msg["tool_calls"]))
+    return total
+
+
+def cap_conversation_length(
+    conversation: dict[str, Any],
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+) -> tuple[dict[str, Any], bool]:
+    """Truncate a conversation to a token budget at a safe boundary.
+
+    Measured on a 522-session corpus, only 37% of records fit a 32k
+    context and the largest was ~3.8M estimated tokens, so an uncapped
+    dataset silently relies on whatever the trainer does when a sample
+    overflows.
+
+    Truncation keeps a *prefix* of the conversation rather than dropping
+    the record: a prefix of an agent trajectory is itself a valid
+    trajectory, whereas dropping loses the long multi-step sessions that
+    are the most valuable training signal. The system message is always
+    retained (it carries the embedded tool schemas), and
+    :func:`remove_orphaned_tool_calls` runs afterwards so the cut can
+    never leave an assistant ``tool_calls`` entry without its matching
+    result.
+
+    Token counts use the same ``estimate_token_count`` heuristic as the
+    scorer, which over-estimates relative to a real BPE tokenizer. The
+    cap is therefore conservative — output fits the budget with room to
+    spare rather than landing just over it.
+
+    Returns ``(conversation, was_truncated)``.
+    """
+    messages = conversation.get("messages", [])
+    if not messages:
+        return conversation, False
+
+    kept: list[dict[str, Any]] = []
+    used = 0
+    for i, msg in enumerate(messages):
+        cost = _message_token_cost(msg)
+        # Always keep the first message even if it alone blows the budget;
+        # a record with no system turn is worse than one that is oversized.
+        if i > 0 and used + cost > max_tokens:
+            break
+        kept.append(msg)
+        used += cost
+
+    if len(kept) == len(messages):
+        return conversation, False
+
+    # Ending on a tool result gives the model nothing to predict, but dropping
+    # that turn can orphan the assistant call before it — and removing *that*
+    # can expose another trailing tool result. Alternate until stable.
+    while kept:
+        while kept and kept[-1].get("role") == "tool":
+            kept.pop()
+        pruned = remove_orphaned_tool_calls(kept)
+        if len(pruned) == len(kept):
+            kept = pruned
+            break
+        kept = pruned
+
+    return {**conversation, "messages": kept}, True
+
+
 def format_for_training(conversation: dict[str, Any]) -> dict[str, Any]:
     """Prepare a conversation record for ``trainer.py`` consumption.
 
