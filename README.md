@@ -1,7 +1,7 @@
 # logminer
 
-A Python CLI for turning raw coding-agent session logs (Claude Code, OpenCode,
-Qwen Code) into clean, redacted, quality-scored JSONL that loads directly into
+A Python CLI for turning raw coding-agent session logs (Claude Code, Cline, Codex,
+OpenCode, Qwen Code) into clean, redacted, quality-scored JSONL that loads directly into
 a HuggingFace SFT pipeline.
 
 The pipeline is a chain of JSONL → JSONL stages. Each stage has its own
@@ -97,6 +97,8 @@ When you omit `--input`, the parser falls back to each provider's standard
 directory:
 
 - **claude** → `~/.claude/projects`
+- **cline** → `~/Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/tasks`
+- **codex** → `~/.codex/sessions`
 - **opencode** → `~/.local/share/opencode`
 - **qwen** → `~/.qwen/projects`
 
@@ -160,6 +162,18 @@ for rec in ds:
 Adding a new agent (e.g. Codex) usually means one new file in
 `logminer/parsers/` plus a one-line entry in `parsers/__init__.py`. The
 pipeline stages are agent-agnostic and don't need changes.
+
+Codex is supported directly: its Responses API-style function-call and
+function-output items are normalized to paired assistant `tool_calls` and
+`tool` turns. Public reasoning summaries and older recoverable reasoning
+events are emitted in the same `<think>…</think>` convention as the other
+parsers; reasoning that Codex does not persist cannot be recovered.
+
+Cline task transcripts are supported directly. Its XML-like tool calls and
+bracketed tool results are normalized to paired assistant `tool_calls` and
+`tool` turns; `<think>` and `<thinking>` content is retained. To keep SFT
+examples tractable, extraction ends after the second `attempt_completion` or
+`task_complete` call in a task.
 
 See `SKILL.md` for the parser contract (`BaseParser`), step-by-step
 instructions, and notes on extending the redaction, scoring, and cleaning

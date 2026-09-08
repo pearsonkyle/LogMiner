@@ -519,7 +519,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_parse.add_argument(
         "--source",
         required=True,
-        help="Provider name (claude, opencode, qwen, all)",
+        help="Provider name (claude, cline, codex, opencode, qwen, all)",
     )
     p_parse.add_argument("--input", default=None, help="Input path (default: provider default)")
     p_parse.add_argument("--output", required=True, help="Output JSONL file")
@@ -582,7 +582,9 @@ def build_parser() -> argparse.ArgumentParser:
     # validate
     p_val = sub.add_parser("validate", help="Validate parsed data against chat template")
     p_val.add_argument("--input", default=None, help="Pre-parsed JSONL file")
-    p_val.add_argument("--source", default=None, help="Parse from source (claude, opencode, qwen)")
+    p_val.add_argument(
+        "--source", default=None, help="Parse from source (claude, cline, codex, opencode, qwen)"
+    )
     p_val.add_argument("--output", default=None, help="Output validated JSONL file")
     p_val.add_argument("--model", default="Qwen/Qwen3.5-4B", help="Tokenizer model")
 

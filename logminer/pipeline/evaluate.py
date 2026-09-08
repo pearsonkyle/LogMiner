@@ -66,8 +66,11 @@ _EMPTY_RATIO_SPAN = 0.30
 _READ_TOOLS = frozenset({"read_file", "view", "cat", "read"})
 _WRITE_TOOLS = frozenset(
     {
+        "delete_file",
         "write_file",
+        "write_to_file",
         "edit",
+        "replace_in_file",
         "create_file",
         "str_replace_editor",
         "str_replace_based_edit_tool",

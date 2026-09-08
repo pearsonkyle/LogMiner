@@ -8,6 +8,8 @@ import pytest
 
 from logminer.parsers import REGISTRY, get_parser
 from logminer.parsers.claude import ClaudeParser
+from logminer.parsers.cline import ClineParser
+from logminer.parsers.codex import CodexParser
 from logminer.parsers.opencode import OpenCodeParser
 from logminer.parsers.qwen import QwenParser
 
@@ -215,12 +217,165 @@ def test_registry_contains_all_parsers():
     assert "claude" in REGISTRY
     assert "opencode" in REGISTRY
     assert "qwen" in REGISTRY
+    assert "codex" in REGISTRY
+    assert "cline" in REGISTRY
 
 
 def test_get_parser_returns_correct_type():
     assert isinstance(get_parser("claude"), ClaudeParser)
     assert isinstance(get_parser("opencode"), OpenCodeParser)
     assert isinstance(get_parser("qwen"), QwenParser)
+    assert isinstance(get_parser("codex"), CodexParser)
+    assert isinstance(get_parser("cline"), ClineParser)
+
+
+# ---------------------------------------------------------------------------
+# Cline parser tests
+# ---------------------------------------------------------------------------
+
+
+def test_cline_parser_extracts_reasoning_tools_and_caps_completions(tmp_path):
+    """Cline XML calls pair with its following bracketed tool-result turns."""
+    task = tmp_path / "123"
+    task.mkdir()
+    transcript = [
+        {"role": "user", "content": [{"type": "text", "text": "Fix the bug."}], "ts": 1},
+        {"role": "assistant", "content": [{"type": "text", "text": "<thinking>Inspect first.</thinking><read_file><path>a.py</path></read_file>"}], "ts": 2},
+        {"role": "user", "content": [{"type": "text", "text": "[read_file for 'a.py'] Result:\nprint('x')"}], "ts": 3},
+        {"role": "assistant", "content": [{"type": "text", "text": "<attempt_completion><result>first</result></attempt_completion>"}], "ts": 4},
+        {"role": "user", "content": [{"type": "text", "text": "[attempt_completion] Result:\nok"}], "ts": 5},
+        {"role": "assistant", "content": [{"type": "text", "text": "<task_complete><result>second</result></task_complete>"}], "ts": 6},
+        {"role": "user", "content": [{"type": "text", "text": "[task_complete] Result:\ndone"}], "ts": 7},
+        {"role": "user", "content": [{"type": "text", "text": "This must be excluded."}], "ts": 8},
+    ]
+    (task / "api_conversation_history.json").write_text(json.dumps(transcript))
+    (task / "task_metadata.json").write_text(json.dumps({"model_usage": [{"model_id": "test-model"}]}))
+
+    result = ClineParser().parse_session(task / "api_conversation_history.json")
+
+    assert result is not None
+    assert result["source"] == "cline"
+    assert result["metadata"]["model"] == "test-model"
+    read_turn = next(
+        m
+        for m in result["messages"]
+        if any(tc["function"]["name"] == "read_file" for tc in m.get("tool_calls", []))
+    )
+    assert read_turn["content"] == "<think>Inspect first.</think>"
+    assert read_turn["tool_calls"][0]["function"]["arguments"] == '{"path": "a.py"}'
+    assert any(m["role"] == "tool" and m["content"] == "print('x')" for m in result["messages"])
+    assert [tc["function"]["name"] for m in result["messages"] for tc in m.get("tool_calls", [])].count("attempt_completion") == 1
+    assert [tc["function"]["name"] for m in result["messages"] for tc in m.get("tool_calls", [])].count("task_complete") == 1
+    assert not any("excluded" in m.get("content", "") for m in result["messages"])
+    schema = next(t for t in result["tools"] if t["function"]["name"] == "read_file")
+    assert schema["function"]["parameters"]["properties"] == {"path": {"type": "string"}}
+
+
+def test_cline_parser_strips_ui_injections_and_preserves_literal_tool_content(tmp_path):
+    task = tmp_path / "123"
+    task.mkdir()
+    transcript = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Implement the page."},
+                {"type": "text", "text": "# task_progress RECOMMENDED\nUse a todo list."},
+                {"type": "text", "text": "<environment_details>editor state</environment_details>"},
+            ],
+        },
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        "<write_to_file><path>page.html</path>"
+                        "<content><div>literal HTML</div></content>"
+                        "<task_progress>- [x] done</task_progress></write_to_file>"
+                    ),
+                }
+            ],
+        },
+        {"role": "user", "content": [{"type": "text", "text": "[write_to_file] Result:\nok"}]},
+    ]
+    (task / "api_conversation_history.json").write_text(json.dumps(transcript))
+
+    result = ClineParser().parse_session(task / "api_conversation_history.json")
+
+    assert result is not None
+    assert result["messages"][0] == {"role": "user", "content": "Implement the page."}
+    args = json.loads(result["messages"][1]["tool_calls"][0]["function"]["arguments"])
+    assert args == {"path": "page.html", "content": "<div>literal HTML</div>"}
+
+
+# ---------------------------------------------------------------------------
+# Codex parser tests
+# ---------------------------------------------------------------------------
+
+
+def test_codex_parser_preserves_tool_pairing_and_reasoning(tmp_path):
+    session = tmp_path / "2026" / "01" / "02" / "rollout-test.jsonl"
+    session.parent.mkdir(parents=True)
+    entries = [
+        {
+            "timestamp": "2026-01-02T00:00:00Z",
+            "type": "session_meta",
+            "payload": {"id": "codex-session", "cwd": "/projects/demo", "cli_version": "1"},
+        },
+        {
+            "timestamp": "2026-01-02T00:00:01Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "List the files."}],
+            },
+        },
+        {
+            "timestamp": "2026-01-02T00:00:02Z",
+            "type": "event_msg",
+            "payload": {"type": "agent_reasoning_raw_content", "text": "Inspect the directory."},
+        },
+        {
+            "timestamp": "2026-01-02T00:00:03Z",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "shell",
+                "arguments": '{"command":"ls","all":true}',
+                "call_id": "call_1",
+            },
+        },
+        {
+            "timestamp": "2026-01-02T00:00:04Z",
+            "type": "response_item",
+            "payload": {"type": "function_call_output", "call_id": "call_1", "output": "a.py"},
+        },
+        {
+            "timestamp": "2026-01-02T00:00:05Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "There is one file."}],
+            },
+        },
+    ]
+    session.write_text("\n".join(json.dumps(entry) for entry in entries) + "\n")
+
+    result = CodexParser().parse_session(session)
+
+    assert result is not None
+    assert result["id"] == "codex-session"
+    assert result["messages"][1]["tool_calls"][0] == {
+        "id": "call_1",
+        "type": "function",
+        "function": {"name": "shell", "arguments": '{"command":"ls","all":true}'},
+    }
+    assert result["messages"][1]["content"] == "<think>\nInspect the directory.\n</think>"
+    assert result["messages"][2] == {"role": "tool", "tool_call_id": "call_1", "content": "a.py"}
+    properties = result["tools"][0]["function"]["parameters"]["properties"]
+    assert properties == {"command": {"type": "string"}, "all": {"type": "boolean"}}
 
 
 def test_get_parser_raises_on_unknown():

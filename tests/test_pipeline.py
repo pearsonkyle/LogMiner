@@ -532,6 +532,36 @@ def _agentic_conversation(
     return {"id": "synth", "source": "claude", "messages": messages}
 
 
+def test_scorer_recognizes_cline_file_edit_tools():
+    conversation = {
+        "id": "cline-edit",
+        "source": "cline",
+        "messages": [
+            {"role": "user", "content": "Please update the implementation." * 100},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "r", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}
+                ],
+            },
+            {"role": "tool", "tool_call_id": "r", "content": "source"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "w", "type": "function", "function": {"name": "replace_in_file", "arguments": "{}"}}
+                ],
+            },
+            {"role": "tool", "tool_call_id": "w", "content": "updated"},
+        ],
+    }
+
+    result = evaluate_conversation(conversation, min_token_count=1)
+
+    assert "editchain:1.00" in result["reasons"]
+
+
 class TestScoreSemantics:
     """Behavioral assertions for the agent-SFT scorer.
 
