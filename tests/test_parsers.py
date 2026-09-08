@@ -12,6 +12,7 @@ from logminer.parsers.cline import ClineParser
 from logminer.parsers.codex import CodexParser
 from logminer.parsers.opencode import OpenCodeParser
 from logminer.parsers.qwen import QwenParser
+from logminer.parsers.base import normalize_tool_arguments
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -229,6 +230,14 @@ def test_get_parser_returns_correct_type():
     assert isinstance(get_parser("cline"), ClineParser)
 
 
+def test_tool_arguments_are_normalized_to_template_objects():
+    """Every harness must provide object arguments to the chat template."""
+    assert normalize_tool_arguments({"path": "a.py"}) == {"path": "a.py"}
+    assert normalize_tool_arguments("stdin") == {"input": "stdin"}
+    assert normalize_tool_arguments(["a", "b"]) == {"input": ["a", "b"]}
+    assert normalize_tool_arguments(None) == {}
+
+
 # ---------------------------------------------------------------------------
 # Cline parser tests
 # ---------------------------------------------------------------------------
@@ -306,6 +315,75 @@ def test_cline_parser_strips_ui_injections_and_preserves_literal_tool_content(tm
     assert result["messages"][0] == {"role": "user", "content": "Implement the page."}
     args = json.loads(result["messages"][1]["tool_calls"][0]["function"]["arguments"])
     assert args == {"path": "page.html", "content": "<div>literal HTML</div>"}
+
+
+def test_cline_parser_normalizes_structured_tool_use_and_preserves_call_id(tmp_path):
+    """Newer Cline histories use explicit tool_use blocks, not XML calls."""
+    task = tmp_path / "structured"
+    task.mkdir()
+    transcript = [
+        {"role": "user", "content": [{"type": "text", "text": "Inspect it."}]},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "I should read the config first."},
+                {"type": "text", "text": "I'll inspect the configuration."},
+                {
+                    "type": "tool_use",
+                    "name": "read_file",
+                    "input": {"path": "config.json"},
+                    "call_id": "persisted-call-1",
+                },
+                {
+                    "type": "tool_use",
+                    "name": "mcp_custom_lookup",
+                    "input": {"query": "setting"},
+                    "call_id": "persisted-call-2",
+                },
+            ],
+        },
+        {"role": "user", "content": [{"type": "text", "text": "[read_file] Result:\n{}"}]},
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "[mcp_custom_lookup] Result:\nfound"}],
+        },
+    ]
+    (task / "api_conversation_history.json").write_text(json.dumps(transcript))
+
+    result = ClineParser().parse_session(task / "api_conversation_history.json")
+
+    assert result is not None
+    assistant = result["messages"][1]
+    assert "<think>I should read the config first.</think>" in assistant["content"]
+    assert "I'll inspect" in assistant["content"]
+    assert [call["id"] for call in assistant["tool_calls"]] == [
+        "persisted-call-1",
+        "persisted-call-2",
+    ]
+    assert json.loads(assistant["tool_calls"][0]["function"]["arguments"]) == {
+        "path": "config.json"
+    }
+    tool_result_ids = [
+        message["tool_call_id"] for message in result["messages"] if message["role"] == "tool"
+    ]
+    assert tool_result_ids == [
+        "persisted-call-1",
+        "persisted-call-2",
+    ]
+    assert {tool["function"]["name"] for tool in result["tools"]} == {
+        "read_file",
+        "mcp_custom_lookup",
+    }
+
+    # The shared SFT formatter receives object arguments and schemas in the
+    # same shape used by every other harness's chat-template invocation.
+    from logminer.pipeline.cleanup import format_for_training
+
+    formatted = format_for_training(result)
+    assert formatted["messages"][0]["tools"] == result["tools"]
+    assert formatted["messages"][1]["tool_calls"][0]["function"]["arguments"] == {
+        "path": "config.json"
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -771,6 +849,7 @@ def test_qwen_parse_tool_call_format(tmp_path):
     tc = asst_msgs[0]["tool_calls"][0]
     assert tc["type"] == "function"
     assert tc["function"]["name"] == "bash"
+    assert "content" in asst_msgs[0]
 
 
 # ---------------------------------------------------------------------------
@@ -809,6 +888,11 @@ def test_opencode_parse_all_messages(tmp_path):
     roles = [m["role"] for m in results[0]["messages"]]
     assert "user" in roles
     assert "assistant" in roles
+    assert all(
+        isinstance(message.get("content"), str)
+        for message in results[0]["messages"]
+        if message["role"] == "assistant"
+    )
     assert "tool" in roles
 
 

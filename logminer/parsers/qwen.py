@@ -3,7 +3,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from logminer.parsers.base import BaseParser, build_tool_schema
+from logminer.parsers.base import BaseParser, build_tool_schema, normalize_tool_arguments
 
 _BUNDLED_SYSTEM_PROMPT = Path(__file__).parent / "qwen_system_prompt.md"
 _USER_SYSTEM_PROMPT = Path.home() / ".qwen" / "system.md"
@@ -97,7 +97,7 @@ class QwenParser(BaseParser):
                     elif "functionCall" in part:
                         fc = part["functionCall"]
                         func_name = fc.get("name", "")
-                        args = fc.get("args", {})
+                        args = normalize_tool_arguments(fc.get("args"))
                         call_id = fc.get("id", f"call_{len(tool_calls)}")
                         if func_name and func_name not in seen_tools:
                             seen_tools[func_name] = build_tool_schema(func_name, args)
@@ -119,9 +119,9 @@ class QwenParser(BaseParser):
                     thought_block = "<think>\n" + "\n".join(thoughts) + "\n</think>"
                     content = (thought_block + "\n" + content).strip() if content else thought_block
 
-                result: dict[str, Any] = {"role": "assistant"}
-                if content:
-                    result["content"] = content
+                # Keep a content key even for silent tool-call turns.  This
+                # is the same OpenAI chat shape emitted by the other harnesses.
+                result: dict[str, Any] = {"role": "assistant", "content": content}
                 if tool_calls:
                     result["tool_calls"] = tool_calls
                 if "content" in result or "tool_calls" in result:

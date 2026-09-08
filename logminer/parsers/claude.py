@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from logminer.parsers.base import BaseParser, build_tool_schema
+from logminer.parsers.base import BaseParser, build_tool_schema, normalize_tool_arguments
 
 _BUNDLED_SYSTEM_PROMPT = Path(__file__).parent / "claude_system_prompt.md"
 _USER_SYSTEM_PROMPT = Path.home() / ".claude" / "system.md"
@@ -265,7 +265,7 @@ class ClaudeParser(BaseParser):
                         elif btype == "tool_use":
                             tid = block.get("id", "")
                             name = block.get("name", "")
-                            inp = block.get("input", {})
+                            inp = normalize_tool_arguments(block.get("input"))
                             if name and name not in seen_tools:
                                 seen_tools[name] = build_tool_schema(name, inp)
                             tool_call: dict[str, Any] = {

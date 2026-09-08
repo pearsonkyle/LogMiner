@@ -3,6 +3,21 @@ from pathlib import Path
 from typing import Any
 
 
+def normalize_tool_arguments(value: Any) -> dict[str, Any]:
+    """Return an object suitable for OpenAI-style chat-template tool calls.
+
+    Harnesses normally persist object arguments, but a few custom/MCP tools
+    use scalar or list input.  ``apply_chat_template`` expects an object, so
+    preserve those values under ``input`` rather than emitting an invalid
+    tool-call payload.
+    """
+    if isinstance(value, dict):
+        return value
+    if value is None:
+        return {}
+    return {"input": value}
+
+
 def build_tool_schema(func_name: str, args: dict) -> dict:
     """Build an OpenAI-style tool schema from a function name and sample args."""
     properties = {}

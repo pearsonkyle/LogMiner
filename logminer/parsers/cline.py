@@ -13,7 +13,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from logminer.parsers.base import BaseParser, build_tool_schema
+from logminer.parsers.base import BaseParser, build_tool_schema, normalize_tool_arguments
 
 # These are Cline's top-level XML tools.  Restricting extraction to this list
 # avoids treating HTML, examples, and arbitrary XML in an answer as a call.
@@ -101,15 +101,18 @@ def _tool_arguments(body: str) -> dict[str, Any]:
     return {"input": text} if text else {}
 
 
-def _extract_assistant(text: str, include_thinking: bool) -> tuple[str, list[tuple[str, dict[str, Any]]]]:
-    calls: list[tuple[str, dict[str, Any]]] = []
+def _extract_assistant(
+    text: str, include_thinking: bool
+) -> tuple[str, list[tuple[str, dict[str, Any], str | None]]]:
+    """Extract Cline's legacy XML calls from one text block."""
+    calls: list[tuple[str, dict[str, Any], str | None]] = []
 
     def replace(match: re.Match[str]) -> str:
         name, body = match["name"], match["body"]
         if name in ("think", "thinking"):
             return f"<think>{body.strip()}</think>" if include_thinking and body.strip() else ""
         if name in _TOOLS:
-            calls.append((name, _tool_arguments(body)))
+            calls.append((name, _tool_arguments(body), None))
             return ""
         return match.group(0)
 
@@ -119,10 +122,55 @@ def _extract_assistant(text: str, include_thinking: bool) -> tuple[str, list[tup
         marker = f"<{name}>"
         if marker in content:
             before, body = content.split(marker, 1)
-            calls.append((name, _tool_arguments(body)))
+            calls.append((name, _tool_arguments(body), None))
             content = before
             break
     return content.strip(), calls
+
+
+def _assistant_content(
+    value: Any, include_thinking: bool
+) -> tuple[str, list[tuple[str, dict[str, Any], str | None]]]:
+    """Normalize both Cline assistant content encodings.
+
+    Older transcripts keep XML calls inside ``type: text`` blocks. Newer
+    persisted histories can instead contain explicit ``tool_use`` blocks,
+    analogous to Claude's wire format. Explicit blocks are authoritative and
+    may name MCP tools outside the fixed legacy XML allow-list.
+    """
+    if isinstance(value, str):
+        return _extract_assistant(value, include_thinking)
+    if not isinstance(value, list):
+        return "", []
+
+    text_parts: list[str] = []
+    calls: list[tuple[str, dict[str, Any], str | None]] = []
+    for block in value:
+        if not isinstance(block, dict):
+            continue
+        block_type = block.get("type")
+        if block_type == "text" and isinstance(block.get("text"), str):
+            text, block_calls = _extract_assistant(block["text"], include_thinking)
+            if text:
+                text_parts.append(text)
+            calls.extend(block_calls)
+        elif block_type in ("think", "thinking") and include_thinking:
+            thought = block.get("thinking", block.get("text", block.get("content", "")))
+            if isinstance(thought, str) and thought.strip():
+                text_parts.append(f"<think>{thought.strip()}</think>")
+        elif block_type == "tool_use":
+            name = block.get("name")
+            if not isinstance(name, str) or not name:
+                continue
+            call_id = block.get("call_id", block.get("id"))
+            calls.append(
+                (
+                    name,
+                    normalize_tool_arguments(block.get("input", block.get("arguments"))),
+                    call_id if isinstance(call_id, str) and call_id else None,
+                )
+            )
+    return "\n".join(text_parts).strip(), calls
 
 
 class ClineParser(BaseParser):
@@ -161,13 +209,6 @@ class ClineParser(BaseParser):
             if not isinstance(entry, dict):
                 continue
             role = entry.get("role")
-            text = (
-                _user_text_content(entry.get("content"))
-                if role == "user"
-                else _text_content(entry.get("content"))
-            )
-            if not text:
-                continue
             if entry.get("ts"):
                 metadata["start_time"] = metadata.get("start_time") or entry["ts"]
                 metadata["end_time"] = entry["ts"]
@@ -175,14 +216,16 @@ class ClineParser(BaseParser):
             if role == "assistant":
                 if stop_after_result:
                     break
-                content, calls = _extract_assistant(text, include_thinking)
+                content, calls = _assistant_content(entry.get("content"), include_thinking)
                 assistant: dict[str, Any] = {"role": "assistant", "content": content}
-                for index, (name, args) in enumerate(calls):
+                for index, (name, args, persisted_id) in enumerate(calls):
                     # A malformed/combined transcript can contain several
                     # completion tags in one turn; never admit a third one.
                     if name in _COMPLETE_TOOLS and complete_calls >= 2:
                         break
-                    call_id = f"cline-{session_path.parent.name}-{len(messages)}-{index}"
+                    call_id = persisted_id or (
+                        f"cline-{session_path.parent.name}-{len(messages)}-{index}"
+                    )
                     assistant.setdefault("tool_calls", []).append({"id": call_id, "type": "function", "function": {"name": name, "arguments": json.dumps(args)}})
                     pending.append((call_id, name))
                     tools.setdefault(name, build_tool_schema(name, args))
@@ -195,6 +238,9 @@ class ClineParser(BaseParser):
                 continue
 
             if role != "user":
+                continue
+            text = _user_text_content(entry.get("content"))
+            if not text:
                 continue
             match = _RESULT.match(text)
             if match and pending:
